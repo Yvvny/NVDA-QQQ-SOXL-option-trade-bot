@@ -45,6 +45,8 @@ class TastytradeSdkDataSource:
         quote_class: Any | None = None,
         greeks_class: Any | None = None,
     ) -> None:
+        self.source_name = "tastytrade_sdk"
+
         if not username or not password:
             raise TastytradeDataError(
                 "TASTYTRADE_USERNAME and TASTYTRADE_PASSWORD are required for source=tastytrade."
@@ -203,8 +205,8 @@ def contracts_from_sdk_options(
                 theta=_optional_float(getattr(greek, "theta", None)),
                 vega=_optional_float(getattr(greek, "vega", None)),
                 iv=iv,
-                volume=None,
-                open_interest=None,
+                volume=_optional_int(getattr(option, "volume", None)),
+                open_interest=_optional_int(getattr(option, "open_interest", None)),
             )
         )
     return contracts
@@ -304,6 +306,16 @@ def _optional_float(value: Any) -> float | None:
     if numeric != numeric:
         return None
     return numeric
+
+
+def _optional_int(value: Any) -> int | None:
+    if value is None:
+        return None
+    try:
+        numeric = int(value)
+    except (TypeError, ValueError):
+        return None
+    return numeric if numeric >= 0 else None
 
 
 def _map_option_type(value: Any) -> OptionType:

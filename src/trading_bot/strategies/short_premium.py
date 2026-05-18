@@ -20,6 +20,8 @@ class ShortPremiumEngine(StrategyEngine):
     ) -> StrategyCandidate | None:
         if score.total < self.settings.strategy.min_entry_score:
             return None
+        if "short_premium_blocked_crash_risk_off" in score.reason_codes:
+            return None
         if not (self.settings.dte.short_premium_min <= dte <= self.settings.dte.short_premium_max):
             return None
 
@@ -65,6 +67,8 @@ class ShortPremiumEngine(StrategyEngine):
         score: StrategyScoreResult,
     ) -> StrategyCandidate | None:
         if score.total < self.settings.strategy.min_entry_score:
+            return None
+        if "short_premium_blocked_crash_risk_off" in score.reason_codes:
             return None
         if not (21 <= dte <= self.settings.dte.short_premium_max):
             return None
@@ -149,6 +153,7 @@ def _credit_spread_candidate(
             reason_codes=("credit_spread_standard_exit",),
         ),
         score_breakdown=score.breakdown,
+        event_risk_blocked="event_risk_penalty" in score.reason_codes,
     )
 
 

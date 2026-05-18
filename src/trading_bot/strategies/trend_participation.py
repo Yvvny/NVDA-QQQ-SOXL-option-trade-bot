@@ -155,6 +155,7 @@ def _debit_spread_candidate(
             reason_codes=("debit_spread_standard_exit",),
         ),
         score_breakdown=score.breakdown,
+        event_risk_blocked="event_risk_penalty" in score.reason_codes,
     )
 
 

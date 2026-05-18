@@ -74,10 +74,10 @@ class _FakeTastytradeDataSource:
                 last=510.1,
             ),
             option_contracts=(
-                _contract(expiration, "call", 510, 0.55, 0.75, 0.85),
-                _contract(expiration, "call", 512, 0.30, 0.25, 0.35),
-                _contract(expiration, "put", 450, -0.25, 0.45, 0.55),
-                _contract(expiration, "put", 449, -0.10, 0.20, 0.30),
+                _contract(expiration, "call", 510, 0.55, 0.79, 0.81),
+                _contract(expiration, "call", 512, 0.30, 0.29, 0.31),
+                _contract(expiration, "put", 450, -0.25, 0.49, 0.51),
+                _contract(expiration, "put", 449, -0.10, 0.24, 0.26),
             ),
         )
 

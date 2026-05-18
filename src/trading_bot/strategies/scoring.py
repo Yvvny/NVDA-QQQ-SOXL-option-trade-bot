@@ -72,6 +72,14 @@ def _score_regime_fit(
         RegimeLabel.BEAR_TREND_HIGH_IV: {"put_credit_spread"},
         RegimeLabel.RANGE_LOW_IV: {"call_debit_spread", "put_debit_spread"},
     }
+    short_premium_strategies = {
+        "put_credit_spread",
+        "call_credit_spread",
+        "iron_condor",
+    }
+    if regime_label == RegimeLabel.CRASH_RISK_OFF and strategy_name in short_premium_strategies:
+        reason_codes.append("short_premium_blocked_crash_risk_off")
+        return 0.0
 
     if strategy_name in preferred.get(regime_label, set()):
         reason_codes.append("regime_fit_preferred")

@@ -55,8 +55,8 @@ def test_put_credit_spread_candidate_has_correct_legs_and_max_loss():
 
     candidate = ShortPremiumEngine().generate_put_credit_spread(
         contracts=[
-            _contract("put", 450, -0.25, 0.40, 0.50),
-            _contract("put", 449, -0.10, 0.15, 0.25),
+            _contract("put", 450, -0.25, 0.43, 0.47),
+            _contract("put", 449, -0.10, 0.19, 0.21),
         ],
         underlying="QQQ",
         dte=30,
@@ -75,8 +75,8 @@ def test_call_credit_spread_candidate_has_correct_legs_and_max_loss():
 
     candidate = ShortPremiumEngine().generate_call_credit_spread(
         contracts=[
-            _contract("call", 455, 0.25, 0.35, 0.45),
-            _contract("call", 456, 0.10, 0.15, 0.25),
+            _contract("call", 455, 0.25, 0.38, 0.42),
+            _contract("call", 456, 0.10, 0.19, 0.21),
         ],
         underlying="QQQ",
         dte=30,
@@ -95,8 +95,8 @@ def test_call_debit_spread_candidate_has_correct_legs_and_max_loss():
 
     candidate = TrendParticipationEngine().generate_call_debit_spread(
         contracts=[
-            _contract("call", 450, 0.55, 0.75, 0.85),
-            _contract("call", 452, 0.30, 0.25, 0.35),
+            _contract("call", 450, 0.55, 0.78, 0.82),
+            _contract("call", 452, 0.30, 0.29, 0.31),
         ],
         underlying="QQQ",
         dte=21,
@@ -115,8 +115,8 @@ def test_put_debit_spread_candidate_has_correct_legs_and_max_loss():
 
     candidate = TrendParticipationEngine().generate_put_debit_spread(
         contracts=[
-            _contract("put", 450, -0.55, 0.75, 0.85),
-            _contract("put", 448, -0.30, 0.25, 0.35),
+            _contract("put", 450, -0.55, 0.78, 0.82),
+            _contract("put", 448, -0.30, 0.29, 0.31),
         ],
         underlying="QQQ",
         dte=21,
@@ -145,8 +145,8 @@ def test_candidate_generation_rejects_score_below_threshold():
 
     candidate = ShortPremiumEngine().generate_put_credit_spread(
         contracts=[
-            _contract("put", 450, -0.25, 0.40, 0.50),
-            _contract("put", 449, -0.10, 0.15, 0.25),
+            _contract("put", 450, -0.25, 0.43, 0.47),
+            _contract("put", 449, -0.10, 0.19, 0.21),
         ],
         underlying="QQQ",
         dte=30,
@@ -182,11 +182,12 @@ def _contract(
     delta: float,
     bid: float,
     ask: float,
+    expiration: date = EXPIRATION,
 ) -> OptionContract:
     return OptionContract(
         symbol=f"QQQ {EXPIRATION.isoformat()} {strike} {option_type}",
         underlying="QQQ",
-        expiration=EXPIRATION,
+        expiration=expiration,
         strike=strike,
         option_type=OptionType(option_type),
         bid=bid,
@@ -196,3 +197,82 @@ def _contract(
         volume=100,
         open_interest=1000,
     )
+
+
+def test_iron_condor_candidate_has_four_legs_and_defined_risk():
+    score = _score("iron_condor", RegimeLabel.RANGE_HIGH_IV)
+
+    from trading_bot.strategies import NeutralRangeEngine
+
+    candidate = NeutralRangeEngine().generate_iron_condor(
+        contracts=[
+            _contract("put", 450, -0.20, 0.24, 0.26),
+            _contract("put", 449, -0.08, 0.095, 0.105),
+            _contract("call", 460, 0.20, 0.24, 0.26),
+            _contract("call", 461, 0.08, 0.095, 0.105),
+        ],
+        underlying="QQQ",
+        dte=35,
+        score=score,
+    )
+
+    assert candidate is not None
+    assert candidate.strategy_name == "iron_condor"
+    assert [leg.action.value for leg in candidate.legs] == ["sell", "buy", "sell", "buy"]
+    assert candidate.max_profit == 30
+    assert candidate.max_loss == 70
+
+
+def test_short_premium_is_blocked_in_crash_regime_even_with_otherwise_good_score():
+    score = _score("put_credit_spread", RegimeLabel.CRASH_RISK_OFF)
+
+    candidate = ShortPremiumEngine().generate_put_credit_spread(
+        contracts=[
+            _contract("put", 450, -0.25, 0.43, 0.47),
+            _contract("put", 449, -0.10, 0.19, 0.21),
+        ],
+        underlying="QQQ",
+        dte=30,
+        score=score,
+    )
+
+    assert candidate is None
+    assert "short_premium_blocked_crash_risk_off" in score.reason_codes
+
+
+def test_calendar_and_diagonal_spreads_are_defined_risk_debit_candidates():
+    from datetime import date as _date
+
+    from trading_bot.strategies import CalendarDiagonalEngine
+
+    score = _score("calendar_spread", RegimeLabel.RANGE_LOW_IV, iv_rank=20)
+    engine = CalendarDiagonalEngine()
+    front = _date(2026, 1, 15)
+    back = _date(2026, 2, 20)
+    contracts = [
+        _contract("call", 500, 0.50, 0.39, 0.41, expiration=front),
+        _contract("call", 500, 0.55, 0.99, 1.01, expiration=back),
+        _contract("call", 502, 0.30, 0.29, 0.31, expiration=front),
+    ]
+
+    calendar = engine.generate_calendar_spread(
+        contracts,
+        underlying="QQQ",
+        front_dte=14,
+        score=score,
+        as_of=_date(2026, 1, 1),
+    )
+    diagonal = engine.generate_diagonal_spread(
+        contracts,
+        underlying="QQQ",
+        front_dte=14,
+        score=_score("diagonal_spread", RegimeLabel.RANGE_LOW_IV, iv_rank=20),
+        as_of=_date(2026, 1, 1),
+    )
+
+    assert calendar is not None
+    assert calendar.strategy_name == "calendar_spread"
+    assert calendar.max_loss == 60
+    assert diagonal is not None
+    assert diagonal.strategy_name == "diagonal_spread"
+    assert diagonal.max_loss == 70

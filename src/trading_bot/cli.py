@@ -5,6 +5,7 @@ import json
 from collections.abc import Sequence
 from dataclasses import asdict
 
+from trading_bot.api import UiServerConfig, run_ui_server
 from trading_bot.config.settings import load_settings
 from trading_bot.runner import DryRunBotRunner
 
@@ -24,6 +25,15 @@ def build_parser() -> argparse.ArgumentParser:
 
     run = subparsers.add_parser("run", help="Run repeated safe dry-run scan cycles.")
     _add_run_arguments(run, include_loop_arguments=True)
+
+    ui = subparsers.add_parser("ui", help="Start the local safe dry-run web UI.")
+    ui.add_argument("--host", default="127.0.0.1", help="Host interface for the local UI.")
+    ui.add_argument("--port", type=int, default=8765, help="Port for the local UI.")
+    ui.add_argument(
+        "--audit-log",
+        default="docs/reports/trade_audit.jsonl",
+        help="JSONL audit log path for UI runs.",
+    )
     return parser
 
 
@@ -60,6 +70,16 @@ def main(argv: Sequence[str] | None = None) -> int:
         )
         result = runner.run_once()
         print(json.dumps(result.to_dict(), indent=2, sort_keys=True))
+        return 0
+
+    if args.command == "ui":
+        run_ui_server(
+            UiServerConfig(
+                host=args.host,
+                port=args.port,
+                audit_log_path=args.audit_log,
+            )
+        )
         return 0
 
     if args.command == "run":

@@ -55,3 +55,21 @@ class _FakeClient:
     def complete_json(self, prompt: str) -> str:
         self.last_prompt = prompt
         return self.response
+
+
+def test_llm_review_artifact_writer_persists_research_only_jsonl(tmp_path):
+    from trading_bot.llm_review import LLMReviewArtifactWriter
+
+    client = _FakeClient(_review_json())
+    artifact = LLMTradeReviewer(client).review_trade_to_artifact(
+        {"trade_id": "t1", "pnl": 50},
+        trade_id="t1",
+    )
+    path = tmp_path / "llm_reviews.jsonl"
+
+    LLMReviewArtifactWriter(path).write(artifact)
+
+    payload = json.loads(path.read_text(encoding="utf-8"))
+    assert payload["trade_id"] == "t1"
+    assert payload["research_only"] is True
+    assert payload["review"]["trade_quality"] == "B"

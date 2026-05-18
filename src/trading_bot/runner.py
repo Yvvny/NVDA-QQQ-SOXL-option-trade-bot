@@ -8,6 +8,7 @@ from pathlib import Path
 from trading_bot.config.settings import BotSettings, load_settings
 from trading_bot.core.enums import OptionType
 from trading_bot.core.models import OptionContract
+from trading_bot.data.market_data import RetryingMarketDataProvider
 from trading_bot.data.tastytrade_source import TastytradeMarketSnapshot, TastytradeSdkDataSource
 from trading_bot.execution.dry_run import DryRunExecutionResult, DryRunExecutor
 from trading_bot.regime.classifier import MarketRegimeInput, RegimeClassifier, RegimeLabel
@@ -253,10 +254,10 @@ def _mock_score_inputs(regime_label: RegimeLabel) -> tuple[StrategyScoreInput, .
 def _mock_option_chain() -> tuple[OptionContract, ...]:
     expiration = date(2026, 6, 19)
     return (
-        _contract(expiration, "put", 450, -0.25, 0.45, 0.55),
-        _contract(expiration, "put", 449, -0.10, 0.20, 0.30),
-        _contract(expiration, "call", 510, 0.55, 0.75, 0.85),
-        _contract(expiration, "call", 512, 0.30, 0.25, 0.35),
+        _contract(expiration, "put", 450, -0.25, 0.49, 0.51),
+        _contract(expiration, "put", 449, -0.10, 0.24, 0.26),
+        _contract(expiration, "call", 510, 0.55, 0.79, 0.81),
+        _contract(expiration, "call", 512, 0.30, 0.29, 0.31),
     )
 
 

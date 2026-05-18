@@ -15,6 +15,12 @@ class BacktestTrade:
     exit_date: date
     pnl: float
     max_loss: float
+    exit_reason: str = ""
+    entry_price: float | None = None
+    exit_price: float | None = None
+    fees: float = 0.0
+    gross_pnl: float | None = None
+    dte_at_entry: int | None = None
 
 
 @dataclass(frozen=True)
@@ -22,6 +28,7 @@ class BacktestMetrics:
     initial_equity: float
     ending_equity: float
     total_return: float
+    cagr: float | None
     max_drawdown: float
     profit_factor: float | None
     win_rate: float
@@ -86,6 +93,7 @@ def calculate_metrics(trades: list[BacktestTrade], initial_equity: float) -> Bac
     )
     ending_equity = equity
     total_return = (ending_equity - initial_equity) / initial_equity
+    cagr = _cagr(trades, initial_equity, ending_equity)
     sharpe = _sharpe(trade_returns)
     sortino = _sortino(trade_returns)
     calmar = None if max_drawdown == 0 else total_return / max_drawdown
@@ -94,6 +102,7 @@ def calculate_metrics(trades: list[BacktestTrade], initial_equity: float) -> Bac
         initial_equity=initial_equity,
         ending_equity=round(ending_equity, 2),
         total_return=total_return,
+        cagr=cagr,
         max_drawdown=max_drawdown,
         profit_factor=profit_factor,
         win_rate=len(wins) / len(trades) if trades else 0.0,
@@ -111,6 +120,17 @@ def calculate_metrics(trades: list[BacktestTrade], initial_equity: float) -> Bac
         worst_day=min(daily_pnl.values(), default=None),
         worst_week=min(weekly_pnl.values(), default=None),
     )
+
+
+def _cagr(trades: list[BacktestTrade], initial_equity: float, ending_equity: float) -> float | None:
+    if not trades:
+        return None
+    start = min(trade.entry_date for trade in trades)
+    end = max(trade.exit_date for trade in trades)
+    days = (end - start).days
+    if days <= 0 or ending_equity <= 0:
+        return None
+    return (ending_equity / initial_equity) ** (365 / days) - 1
 
 
 def _mean(values: list[float]) -> float | None:
