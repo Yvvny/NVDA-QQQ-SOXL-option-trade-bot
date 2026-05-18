@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+# ruff: noqa: E501
 import json
 from dataclasses import asdict, dataclass, is_dataclass
 from datetime import UTC, date, datetime
@@ -10,8 +11,13 @@ from pathlib import Path
 from typing import Any
 from urllib.parse import parse_qs, urlparse
 
-from trading_bot.config.settings import BotSettings, load_settings
+from trading_bot.broker import fetch_tastytrade_account_snapshot
+from trading_bot.config.settings import load_settings
+from trading_bot.paper import DEFAULT_PAPER_STATE_PATH, PaperTradingSimulator
 from trading_bot.runner import DryRunBotRunner
+
+DEFAULT_PAPER_AUDIT_LOG_PATH = "docs/reports/paper_audit.jsonl"
+DEFAULT_BOT_TRADE_JOURNAL_PATH = "docs/reports/bot_trade_journal.jsonl"
 
 
 @dataclass(frozen=True)
@@ -58,6 +64,32 @@ class _TradingBotUiHandler(BaseHTTPRequestHandler):
             return
         if parsed.path == "/api/config":
             self._send_json(asdict(load_settings()))
+            return
+        if parsed.path == "/api/account":
+            self._send_json(fetch_tastytrade_account_snapshot())
+            return
+        if parsed.path == "/api/account-view":
+            query = parse_qs(parsed.query)
+            account_type = query.get("type", ["paper"])[0]
+            self._send_json(_account_view_payload(account_type))
+            return
+        if parsed.path == "/api/paper":
+            self._send_json(
+                PaperTradingSimulator(state_path=DEFAULT_PAPER_STATE_PATH).load_state().to_summary()
+            )
+            return
+        if parsed.path == "/api/logs":
+            query = parse_qs(parsed.query)
+            log_type = query.get("type", ["paper"])[0]
+            limit = _int_from_query(query, "limit", default=50, minimum=1, maximum=500)
+            path = (
+                DEFAULT_PAPER_AUDIT_LOG_PATH
+                if log_type == "paper"
+                else self.server_config.audit_log_path
+            )
+            self._send_json(
+                {"type": log_type, "path": path, "records": _read_recent_jsonl(path, limit)}
+            )
             return
         if parsed.path == "/api/audit":
             query = parse_qs(parsed.query)
@@ -155,6 +187,238 @@ def _status_payload(audit_log_path: str) -> dict[str, Any]:
         "latest_status": recent_records[-1].get("status") if recent_records else None,
         "server_time": datetime.now(UTC).isoformat(),
     }
+
+
+def _account_view_payload(account_type: str) -> dict[str, Any]:
+    if account_type == "live":
+        return _live_account_view_payload()
+    return _paper_account_view_payload()
+
+
+def _paper_account_view_payload() -> dict[str, Any]:
+    state = PaperTradingSimulator(state_path=DEFAULT_PAPER_STATE_PATH).load_state()
+    summary = state.to_summary()
+    return {
+        "account_type": "paper",
+        "title": "Paper Account",
+        "connected": True,
+        "message": "Virtual $2,000 strategy-spec simulation account.",
+        "updated_at": summary["updated_at"],
+        "metrics": {
+            "equity": summary["equity"],
+            "cash": summary["equity"],
+            "buying_power": max(0.0, summary["equity"] - summary["total_open_max_loss"]),
+            "reserved_risk": summary["total_open_max_loss"],
+            "realized_pnl": summary["realized_pnl"],
+            "unrealized_pnl": summary["unrealized_pnl"],
+            "total_pnl": summary["total_pnl"],
+            "return_pct": summary["total_return_pct"],
+            "open_positions": summary["open_positions"],
+            "closed_trades": summary["closed_trades"],
+        },
+        "positions": [
+            {
+                "id": position.position_id,
+                "symbol": position.underlying,
+                "instrument_type": "Bot Paper Position",
+                "bot_managed": True,
+                "managed_by": "Bot",
+                "strategy": position.strategy_name,
+                "quantity": 1,
+                "direction": position.price_effect,
+                "average_open_price": position.expected_credit_or_debit,
+                "mark_price": None,
+                "mark_value": position.last_mark_value,
+                "day_pnl": position.unrealized_pnl,
+                "max_loss": position.max_loss,
+                "entry_score": position.entry_score,
+                "opened_at": position.opened_at,
+                "exit_plan": position.exit_plan,
+                "reason_codes": [],
+                "legs": [asdict(leg) for leg in position.legs],
+                "raw": asdict(position),
+            }
+            for position in state.open_positions
+        ],
+        "closed_trades": [
+            {
+                "symbol": trade.position.underlying,
+                "strategy": trade.position.strategy_name,
+                "closed_at": trade.closed_at,
+                "exit_reason": trade.exit_reason,
+                "realized_pnl": trade.realized_pnl,
+            }
+            for trade in state.closed_trades[-20:]
+        ],
+        "details": summary,
+        "logs": _read_recent_jsonl(DEFAULT_PAPER_AUDIT_LOG_PATH, 20),
+    }
+
+
+def _live_account_view_payload() -> dict[str, Any]:
+    snapshot = fetch_tastytrade_account_snapshot()
+    balances = snapshot.balances or {}
+    bot_metadata = _bot_position_metadata_index()
+    return {
+        "account_type": "live",
+        "title": "Actual Account",
+        "connected": snapshot.connected,
+        "message": snapshot.message
+        or f"{snapshot.account_type_name or ''} {snapshot.margin_or_cash or ''}".strip(),
+        "updated_at": snapshot.fetched_at,
+        "metrics": {
+            "equity": balances.get("net_liquidating_value"),
+            "cash": balances.get("cash_balance"),
+            "buying_power": balances.get("derivative_buying_power"),
+            "reserved_risk": balances.get("used_derivative_buying_power"),
+            "realized_pnl": None,
+            "unrealized_pnl": None,
+            "total_pnl": None,
+            "return_pct": None,
+            "open_positions": len(snapshot.positions or []),
+            "closed_trades": None,
+        },
+        "positions": [
+            _live_position_view(position, bot_metadata.get(str(position.get("symbol") or "")))
+            for position in (snapshot.positions or [])
+        ],
+        "closed_trades": [],
+        "details": {
+            "account": {
+                "source": snapshot.source,
+                "is_test": snapshot.is_test,
+                "connected": snapshot.connected,
+                "account_number_masked": snapshot.account_number_masked,
+                "account_type_name": snapshot.account_type_name,
+                "margin_or_cash": snapshot.margin_or_cash,
+                "day_trader_status": snapshot.day_trader_status,
+                "fetched_at": snapshot.fetched_at,
+                "message": snapshot.message,
+                "error_type": snapshot.error_type,
+            },
+            "balances": balances,
+            "positions": snapshot.positions or [],
+            "trading_status": snapshot.trading_status or {},
+            "bot_metadata_journal": DEFAULT_BOT_TRADE_JOURNAL_PATH,
+        },
+        "logs": [],
+    }
+
+
+def _live_position_view(
+    position: dict[str, Any], metadata: dict[str, Any] | None
+) -> dict[str, Any]:
+    bot_managed = metadata is not None
+    metadata = metadata or {}
+    strategy = metadata.get("strategy_name") or metadata.get("strategy") or "Manual / External"
+    return {
+        "id": position.get("symbol"),
+        "symbol": position.get("symbol"),
+        "instrument_type": position.get("instrument_type"),
+        "bot_managed": bot_managed,
+        "managed_by": "Bot" if bot_managed else "Manual / External",
+        "strategy": strategy,
+        "quantity": position.get("quantity"),
+        "direction": position.get("quantity_direction"),
+        "average_open_price": position.get("average_open_price"),
+        "mark_price": position.get("mark_price"),
+        "mark_value": position.get("mark"),
+        "day_pnl": (
+            position.get("realized_day_gain")
+            if position.get("realized_day_gain") is not None
+            else position.get("unrealized_day_gain")
+        ),
+        "max_loss": metadata.get("max_loss"),
+        "entry_score": metadata.get("entry_score"),
+        "opened_at": metadata.get("opened_at") or position.get("created_at"),
+        "exit_plan": metadata.get("exit_plan") or {},
+        "reason_codes": metadata.get("reason_codes") or [],
+        "legs": metadata.get("legs") or [],
+        "raw": position,
+    }
+
+
+def _bot_position_metadata_index() -> dict[str, dict[str, Any]]:
+    records = _read_recent_jsonl(DEFAULT_BOT_TRADE_JOURNAL_PATH, 1000)
+    index: dict[str, dict[str, Any]] = {}
+    for record in records:
+        metadata = _bot_position_metadata(record)
+        for symbol in _bot_position_symbols(record):
+            index[symbol] = metadata
+    return index
+
+
+def _bot_position_metadata(record: dict[str, Any]) -> dict[str, Any]:
+    candidate = _first_dict(
+        record.get("candidate"),
+        _nested_dict(record, "trade_record", "candidate"),
+        _nested_dict(record, "order", "candidate"),
+    )
+    position = _first_dict(record.get("position"), record.get("paper_position"))
+    source = candidate or position or record
+    return {
+        "strategy_name": source.get("strategy_name") or record.get("strategy_name"),
+        "underlying": source.get("underlying") or record.get("underlying") or record.get("symbol"),
+        "entry_score": source.get("entry_score") or record.get("entry_score"),
+        "max_loss": source.get("max_loss") or record.get("max_loss"),
+        "max_profit": source.get("max_profit") or record.get("max_profit"),
+        "exit_plan": source.get("exit_plan") or record.get("exit_plan") or {},
+        "reason_codes": source.get("reason_codes") or record.get("reason_codes") or [],
+        "legs": source.get("legs") or record.get("legs") or [],
+        "opened_at": record.get("opened_at") or record.get("logged_at"),
+        "journal_event": record.get("event_type"),
+    }
+
+
+def _bot_position_symbols(record: dict[str, Any]) -> set[str]:
+    symbols = {
+        str(value)
+        for value in (
+            record.get("broker_position_symbol"),
+            record.get("position_symbol"),
+            record.get("option_symbol"),
+        )
+        if value
+    }
+    for container in (
+        record,
+        record.get("candidate"),
+        record.get("position"),
+        record.get("paper_position"),
+        _nested_dict(record, "trade_record", "candidate"),
+        _nested_dict(record, "order", "candidate"),
+    ):
+        if isinstance(container, dict):
+            symbol = container.get("symbol")
+            if symbol:
+                symbols.add(str(symbol))
+            for leg in container.get("legs") or []:
+                if not isinstance(leg, dict):
+                    continue
+                leg_symbol = leg.get("symbol")
+                contract = leg.get("contract") if isinstance(leg.get("contract"), dict) else {}
+                contract_symbol = contract.get("symbol")
+                if leg_symbol:
+                    symbols.add(str(leg_symbol))
+                if contract_symbol:
+                    symbols.add(str(contract_symbol))
+    return symbols
+
+
+def _nested_dict(payload: dict[str, Any], *keys: str) -> dict[str, Any] | None:
+    value: Any = payload
+    for key in keys:
+        if not isinstance(value, dict):
+            return None
+        value = value.get(key)
+    return value if isinstance(value, dict) else None
+
+
+def _first_dict(*values: Any) -> dict[str, Any]:
+    for value in values:
+        if isinstance(value, dict):
+            return value
+    return {}
 
 
 def _read_recent_jsonl(path: str | Path, limit: int) -> list[dict[str, Any]]:
@@ -305,6 +569,14 @@ _HTML = """<!doctype html>
     button:disabled { opacity: 0.55; cursor: progress; }
     .toolbar { display: flex; gap: 8px; align-items: center; }
     .row { display: grid; grid-template-columns: 1fr 1fr; gap: 10px; }
+    .account-status {
+      display: flex;
+      flex-wrap: wrap;
+      gap: 8px;
+      align-items: center;
+      margin-bottom: 12px;
+    }
+    .small-table th, .small-table td { font-size: 12px; }
     pre {
       margin: 0;
       overflow: auto;
@@ -386,6 +658,15 @@ _HTML = """<!doctype html>
         <h2>Safety</h2>
         <div id="safety" class="stack"></div>
       </section>
+      <section>
+        <h2>Account</h2>
+        <div class="account-status">
+          <span id="account-connection" class="pill">not loaded</span>
+          <span id="account-number" class="pill">account</span>
+          <button class="secondary" id="refresh-account" type="button">Refresh Account</button>
+        </div>
+        <div id="account-message" class="label"></div>
+      </section>
     </div>
     <div class="stack">
       <section>
@@ -406,6 +687,55 @@ _HTML = """<!doctype html>
         </div>
       </section>
       <section>
+        <h2>Account Balances</h2>
+        <div class="grid">
+          <div class="metric">
+            <div class="label">Net Liq</div><div id="net-liq" class="value"></div>
+          </div>
+          <div class="metric">
+            <div class="label">Cash</div><div id="cash-balance" class="value"></div>
+          </div>
+          <div class="metric">
+            <div class="label">Derivative BP</div><div id="derivative-bp" class="value"></div>
+          </div>
+          <div class="metric">
+            <div class="label">Maintenance</div><div id="maintenance-req" class="value"></div>
+          </div>
+        </div>
+      </section>
+      <section>
+        <h2>Paper Account</h2>
+        <div class="grid">
+          <div class="metric">
+            <div class="label">Virtual Equity</div><div id="paper-equity" class="value"></div>
+          </div>
+          <div class="metric">
+            <div class="label">Total P/L</div><div id="paper-pnl" class="value"></div>
+          </div>
+          <div class="metric">
+            <div class="label">Return</div><div id="paper-return" class="value"></div>
+          </div>
+          <div class="metric">
+            <div class="label">Open Paper</div><div id="paper-open" class="value"></div>
+          </div>
+        </div>
+      </section>
+      <section>
+        <h2>Positions</h2>
+        <table class="small-table">
+          <thead>
+            <tr>
+              <th>Symbol</th><th>Type</th><th>Qty</th><th>Avg</th><th>Mark</th><th>Day P/L</th>
+            </tr>
+          </thead>
+          <tbody id="positions-body"></tbody>
+        </table>
+      </section>
+      <section>
+        <h2>Trading Status</h2>
+        <pre id="trading-status">{}</pre>
+      </section>
+      <section>
         <h2>Last Run</h2>
         <pre id="run-output">{}</pre>
       </section>
@@ -420,6 +750,8 @@ _HTML = """<!doctype html>
   </main>
   <script>
     const statusUrl = "/api/status";
+    const accountUrl = "/api/account";
+    const paperUrl = "/api/paper";
     const auditUrl = "/api/audit?limit=12";
     const runUrl = "/api/run-once";
 
@@ -430,6 +762,12 @@ _HTML = """<!doctype html>
     function safetyRow(name, value) {
       const cls = value ? "bad" : "good";
       return `<div><span class="${cls}">${value ? "blocked" : "safe"}</span> ${name}</div>`;
+    }
+
+    function money(value) {
+      const numeric = Number(value);
+      if (!Number.isFinite(numeric)) return "";
+      return "$" + numeric.toLocaleString(undefined, {maximumFractionDigits: 2});
     }
 
     async function loadStatus() {
@@ -446,6 +784,50 @@ _HTML = """<!doctype html>
         safetyRow("market orders", status.allow_market_orders_options)
       ].join("");
       await loadAudit();
+      await loadPaper();
+    }
+
+    async function loadPaper() {
+      const paper = await fetch(paperUrl).then(r => r.json());
+      text("paper-equity", money(paper.equity));
+      text("paper-pnl", money(paper.total_pnl));
+      text("paper-return", `${paper.total_return_pct ?? 0}%`);
+      text("paper-open", paper.open_positions ?? 0);
+    }
+
+    async function loadAccount() {
+      const account = await fetch(accountUrl).then(r => r.json());
+      const connection = document.getElementById("account-connection");
+      connection.textContent = account.connected ? "connected" : "not connected";
+      connection.className = "pill " + (account.connected ? "good" : "warn");
+      text("account-number", account.account_number_masked || "account");
+      text("account-message", account.connected
+        ? `${account.account_type_name || ""} ${account.margin_or_cash || ""}`.trim()
+        : `${account.error_type || "AccountError"}: ${account.message || ""}`);
+
+      const balances = account.balances || {};
+      text("net-liq", money(balances.net_liquidating_value));
+      text("cash-balance", money(balances.cash_balance));
+      text("derivative-bp", money(balances.derivative_buying_power));
+      text("maintenance-req", money(balances.maintenance_requirement));
+
+      const positionRows = (account.positions || []).map(position => {
+        return `<tr>
+          <td>${position.symbol || ""}</td>
+          <td>${position.instrument_type || ""}</td>
+          <td>${position.quantity || ""} ${position.quantity_direction || ""}</td>
+          <td>${money(position.average_open_price)}</td>
+          <td>${money(position.mark || position.mark_price)}</td>
+          <td>${money(position.realized_day_gain)}</td>
+        </tr>`;
+      });
+      document.getElementById("positions-body").innerHTML = positionRows.join("")
+        || '<tr><td colspan="6">No open positions loaded.</td></tr>';
+      document.getElementById("trading-status").textContent = JSON.stringify(
+        account.trading_status || {},
+        null,
+        2
+      );
     }
 
     async function loadAudit() {
@@ -464,6 +846,7 @@ _HTML = """<!doctype html>
     }
 
     document.getElementById("refresh").addEventListener("click", loadStatus);
+    document.getElementById("refresh-account").addEventListener("click", loadAccount);
     document.getElementById("run-form").addEventListener("submit", async event => {
       event.preventDefault();
       const button = document.getElementById("run-once");
@@ -488,6 +871,456 @@ _HTML = """<!doctype html>
       }
     });
     loadStatus();
+    loadAccount();
+  </script>
+</body>
+</html>
+"""
+
+_HTML = """<!doctype html>
+<html lang="en">
+<head>
+  <meta charset="utf-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1">
+  <title>Trading Bot Control</title>
+  <style>
+    :root {
+      color-scheme: dark;
+      --bg: #0f1216;
+      --panel: #171c22;
+      --panel-2: #1f2630;
+      --border: #303945;
+      --text: #edf2f7;
+      --muted: #a8b3c2;
+      --good: #45c486;
+      --warn: #f2b84b;
+      --bad: #ef6b6b;
+      --accent: #6bb5ff;
+    }
+    * { box-sizing: border-box; }
+    body {
+      margin: 0;
+      font-family: Inter, Segoe UI, Arial, sans-serif;
+      background: var(--bg);
+      color: var(--text);
+      font-size: 14px;
+    }
+    header {
+      display: flex;
+      align-items: center;
+      justify-content: space-between;
+      gap: 16px;
+      padding: 16px 22px;
+      border-bottom: 1px solid var(--border);
+      background: #12171d;
+      position: sticky;
+      top: 0;
+      z-index: 5;
+    }
+    h1 { margin: 0; font-size: 18px; font-weight: 650; }
+    h2 {
+      margin: 0 0 12px;
+      font-size: 14px;
+      font-weight: 650;
+      color: var(--muted);
+      text-transform: uppercase;
+      letter-spacing: 0;
+    }
+    main {
+      display: grid;
+      grid-template-columns: minmax(0, 1fr);
+      gap: 14px;
+      padding: 16px;
+      max-width: 1320px;
+      margin: 0 auto;
+    }
+    section {
+      border: 1px solid var(--border);
+      background: var(--panel);
+      border-radius: 8px;
+      padding: 14px;
+    }
+    .toolbar { display: flex; gap: 8px; align-items: center; flex-wrap: wrap; }
+    .toolbar select, input {
+      border: 1px solid var(--border);
+      background: #101419;
+      color: var(--text);
+      border-radius: 6px;
+      padding: 8px 10px;
+      font: inherit;
+    }
+    button {
+      border: 1px solid #3478b9;
+      background: #15568e;
+      color: white;
+      border-radius: 6px;
+      padding: 9px 11px;
+      font-weight: 650;
+      cursor: pointer;
+    }
+    button.secondary {
+      border-color: var(--border);
+      background: var(--panel-2);
+    }
+    button:disabled { opacity: 0.55; cursor: progress; }
+    .pill {
+      display: inline-flex;
+      align-items: center;
+      min-height: 24px;
+      border-radius: 999px;
+      border: 1px solid var(--border);
+      padding: 0 10px;
+      color: var(--muted);
+      background: var(--panel-2);
+      white-space: nowrap;
+    }
+    .good { color: var(--good); }
+    .warn { color: var(--warn); }
+    .bad { color: var(--bad); }
+    .account-header {
+      display: flex;
+      align-items: flex-start;
+      justify-content: space-between;
+      gap: 12px;
+      flex-wrap: wrap;
+    }
+    .account-title { font-size: 20px; font-weight: 700; margin-bottom: 4px; }
+    .muted { color: var(--muted); }
+    .grid {
+      display: grid;
+      grid-template-columns: repeat(4, minmax(150px, 1fr));
+      gap: 12px;
+    }
+    .metric {
+      min-height: 78px;
+      border: 1px solid var(--border);
+      background: var(--panel-2);
+      border-radius: 8px;
+      padding: 12px;
+    }
+    .label { color: var(--muted); font-size: 12px; }
+    .value { margin-top: 8px; font-size: 21px; font-weight: 700; overflow-wrap: anywhere; }
+    table {
+      width: 100%;
+      border-collapse: collapse;
+      table-layout: fixed;
+    }
+    th, td {
+      text-align: left;
+      border-bottom: 1px solid var(--border);
+      padding: 9px 8px;
+      vertical-align: top;
+      overflow-wrap: anywhere;
+      font-size: 12px;
+    }
+    th { color: var(--muted); font-weight: 600; }
+    pre {
+      margin: 0;
+      overflow: auto;
+      max-height: 520px;
+      background: #0b0e12;
+      border: 1px solid var(--border);
+      border-radius: 8px;
+      padding: 12px;
+      color: #d8e2ee;
+      line-height: 1.45;
+      font-size: 12px;
+    }
+    details summary {
+      cursor: pointer;
+      color: var(--muted);
+      font-weight: 650;
+      margin-bottom: 10px;
+    }
+    .diagnostic-form {
+      display: grid;
+      grid-template-columns: repeat(5, minmax(120px, 1fr));
+      gap: 10px;
+      align-items: end;
+    }
+    .diagnostic-form label { display: grid; gap: 5px; color: var(--muted); font-size: 12px; }
+    .diagnostic-form input, .diagnostic-form select { width: 100%; }
+    @media (max-width: 900px) {
+      header { align-items: flex-start; flex-direction: column; }
+      .grid { grid-template-columns: repeat(2, minmax(120px, 1fr)); }
+      .diagnostic-form { grid-template-columns: 1fr 1fr; }
+    }
+  </style>
+</head>
+<body>
+  <header>
+    <div>
+      <h1>Trading Bot Control</h1>
+      <div class="muted">Same layout for paper and actual account. Actual account is read-only.</div>
+    </div>
+    <div class="toolbar">
+      <span id="mode-pill" class="pill">dry_run</span>
+      <select id="account-select" title="Account view">
+        <option value="paper">Paper Account</option>
+        <option value="live">Actual Account</option>
+      </select>
+      <button id="refresh">Refresh</button>
+    </div>
+  </header>
+  <main>
+    <section>
+      <div class="account-header">
+        <div>
+          <div id="account-title" class="account-title">Paper Account</div>
+          <div id="account-message" class="muted"></div>
+        </div>
+        <div class="toolbar">
+          <span id="connection-pill" class="pill">not loaded</span>
+          <button class="secondary" id="show-details">Detailed Info</button>
+          <button class="secondary" id="show-logs">Logs</button>
+        </div>
+      </div>
+    </section>
+
+    <section>
+      <h2>Account Overview</h2>
+      <div class="grid">
+        <div class="metric"><div class="label">Equity / Net Liq</div><div id="metric-equity" class="value"></div></div>
+        <div class="metric"><div class="label">Cash</div><div id="metric-cash" class="value"></div></div>
+        <div class="metric"><div class="label">Buying Power</div><div id="metric-buying-power" class="value"></div></div>
+        <div class="metric"><div class="label">Reserved Risk / Used BP</div><div id="metric-reserved-risk" class="value"></div></div>
+        <div class="metric"><div class="label">Realized P/L</div><div id="metric-realized" class="value"></div></div>
+        <div class="metric"><div class="label">Unrealized P/L</div><div id="metric-unrealized" class="value"></div></div>
+        <div class="metric"><div class="label">Total P/L</div><div id="metric-total-pnl" class="value"></div></div>
+        <div class="metric"><div class="label">Return</div><div id="metric-return" class="value"></div></div>
+      </div>
+    </section>
+
+    <section>
+      <h2>Positions</h2>
+      <table>
+        <thead>
+          <tr>
+            <th>Symbol</th><th>Managed By</th><th>Type</th><th>Strategy</th><th>Qty</th><th>Direction</th>
+            <th>Avg Price</th><th>Mark Price</th><th>Mark Value</th><th>P/L</th><th>Risk / Score</th>
+          </tr>
+        </thead>
+        <tbody id="positions-body"></tbody>
+      </table>
+    </section>
+
+    <section>
+      <h2>Closed Trades</h2>
+      <table>
+        <thead><tr><th>Symbol</th><th>Strategy</th><th>Closed</th><th>Reason</th><th>Realized P/L</th></tr></thead>
+        <tbody id="closed-body"></tbody>
+      </table>
+    </section>
+
+    <section id="details-section">
+      <h2>Detailed Info</h2>
+      <pre id="details-output">{}</pre>
+    </section>
+
+    <section id="logs-section">
+      <h2>Recent Logs</h2>
+      <table>
+        <thead><tr><th>Time</th><th>Event</th><th>Status / Summary</th></tr></thead>
+        <tbody id="logs-body"></tbody>
+      </table>
+      <pre id="logs-output" style="margin-top: 12px;">[]</pre>
+    </section>
+
+    <section>
+      <details>
+        <summary>Diagnostic Dry-Run Tool</summary>
+        <form id="run-form" class="diagnostic-form">
+          <label>Source
+            <select name="source">
+              <option value="mock">mock</option>
+              <option value="tastytrade">tastytrade</option>
+            </select>
+          </label>
+          <label>Symbol
+            <input name="symbol" value="QQQ" autocomplete="off">
+          </label>
+          <label>Target DTE
+            <input name="target_dte" type="number" min="1" value="30">
+          </label>
+          <label>Max Candidates
+            <input name="max_candidates" type="number" min="1" value="1">
+          </label>
+          <button id="run-once" type="submit">Run Diagnostic</button>
+        </form>
+        <pre id="run-output" style="margin-top: 12px;">{}</pre>
+      </details>
+    </section>
+  </main>
+  <script>
+    const statusUrl = "/api/status";
+    const accountViewUrl = "/api/account-view";
+    const logsUrl = "/api/logs";
+    const runUrl = "/api/run-once";
+    let currentAccount = "paper";
+    let currentView = null;
+
+    function text(id, value) {
+      document.getElementById(id).textContent = value ?? "";
+    }
+
+    function money(value) {
+      const numeric = Number(value);
+      if (!Number.isFinite(numeric)) return "N/A";
+      return "$" + numeric.toLocaleString(undefined, {maximumFractionDigits: 2});
+    }
+
+    function pct(value) {
+      const numeric = Number(value);
+      if (!Number.isFinite(numeric)) return "N/A";
+      return numeric.toLocaleString(undefined, {maximumFractionDigits: 2}) + "%";
+    }
+
+    function plain(value) {
+      return value === null || value === undefined || value === "" ? "N/A" : value;
+    }
+
+    function safe(value) {
+      return String(plain(value))
+        .replaceAll("&", "&amp;")
+        .replaceAll("<", "&lt;")
+        .replaceAll(">", "&gt;")
+        .replaceAll('"', "&quot;")
+        .replaceAll("'", "&#039;");
+    }
+
+    async function loadStatus() {
+      const status = await fetch(statusUrl).then(r => r.json());
+      text("mode-pill", status.mode);
+    }
+
+    async function loadAccountView() {
+      currentAccount = document.getElementById("account-select").value;
+      const view = await fetch(`${accountViewUrl}?type=${currentAccount}`).then(r => r.json());
+      currentView = view;
+      renderAccountView(view);
+      await loadLogs();
+      await loadStatus();
+    }
+
+    function renderAccountView(view) {
+      const metrics = view.metrics || {};
+      text("account-title", view.title || "Account");
+      text("account-message", view.message || "");
+      const pill = document.getElementById("connection-pill");
+      pill.textContent = view.connected ? "connected" : "not connected";
+      pill.className = "pill " + (view.connected ? "good" : "warn");
+
+      text("metric-equity", money(metrics.equity));
+      text("metric-cash", money(metrics.cash));
+      text("metric-buying-power", money(metrics.buying_power));
+      text("metric-reserved-risk", money(metrics.reserved_risk));
+      text("metric-realized", money(metrics.realized_pnl));
+      text("metric-unrealized", money(metrics.unrealized_pnl));
+      text("metric-total-pnl", money(metrics.total_pnl));
+      text("metric-return", pct(metrics.return_pct));
+
+      const positionRows = (view.positions || []).map(position => {
+        const riskScore = [
+          position.max_loss === null || position.max_loss === undefined ? "" : `risk ${money(position.max_loss)}`,
+          position.entry_score === null || position.entry_score === undefined ? "" : `score ${position.entry_score}`
+        ].filter(Boolean).join(" / ");
+        return `<tr>
+          <td>${safe(position.symbol)}</td>
+          <td>${safe(position.managed_by)}</td>
+          <td>${safe(position.instrument_type)}</td>
+          <td>${safe(position.strategy)}</td>
+          <td>${safe(position.quantity)}</td>
+          <td>${safe(position.direction)}</td>
+          <td>${money(position.average_open_price)}</td>
+          <td>${money(position.mark_price)}</td>
+          <td>${money(position.mark_value)}</td>
+          <td>${money(position.day_pnl)}</td>
+          <td>${riskScore || "N/A"}</td>
+        </tr>`;
+      });
+      document.getElementById("positions-body").innerHTML = positionRows.join("")
+        || '<tr><td colspan="11">No positions for this account view.</td></tr>';
+
+      const closedRows = (view.closed_trades || []).map(trade => {
+        return `<tr>
+          <td>${safe(trade.symbol)}</td>
+          <td>${safe(trade.strategy)}</td>
+          <td>${safe(trade.closed_at)}</td>
+          <td>${safe(trade.exit_reason)}</td>
+          <td>${money(trade.realized_pnl)}</td>
+        </tr>`;
+      });
+      document.getElementById("closed-body").innerHTML = closedRows.join("")
+        || '<tr><td colspan="5">No closed trades in this account view.</td></tr>';
+
+      document.getElementById("details-output").textContent = JSON.stringify(
+        view.details || {},
+        null,
+        2
+      );
+    }
+
+    async function loadLogs() {
+      const payload = await fetch(`${logsUrl}?type=${currentAccount === "paper" ? "paper" : "dry"}&limit=50`)
+        .then(r => r.json());
+      const rows = (payload.records || []).map(record => {
+        const result = record.result || {};
+        const candidate = record.candidate || {};
+        const summary = result.summary || {};
+        const shortSummary = [
+          record.status,
+          candidate.strategy_name,
+          result.opened_positions === undefined ? "" : `opened ${result.opened_positions}`,
+          result.rejected_candidates === undefined ? "" : `rejected ${result.rejected_candidates}`,
+          summary.equity === undefined ? "" : `equity ${money(summary.equity)}`
+        ].filter(Boolean).join(" | ");
+        return `<tr>
+          <td>${safe(record.logged_at)}</td>
+          <td>${safe(record.event_type)}</td>
+          <td>${safe(shortSummary || "see raw log below")}</td>
+        </tr>`;
+      });
+      document.getElementById("logs-body").innerHTML = rows.join("")
+        || '<tr><td colspan="3">No logs yet.</td></tr>';
+      document.getElementById("logs-output").textContent = JSON.stringify(
+        payload.records || [],
+        null,
+        2
+      );
+    }
+
+    document.getElementById("account-select").addEventListener("change", loadAccountView);
+    document.getElementById("refresh").addEventListener("click", loadAccountView);
+    document.getElementById("show-details").addEventListener("click", () => {
+      document.getElementById("details-section").scrollIntoView({behavior: "smooth"});
+    });
+    document.getElementById("show-logs").addEventListener("click", () => {
+      document.getElementById("logs-section").scrollIntoView({behavior: "smooth"});
+    });
+    document.getElementById("run-form").addEventListener("submit", async event => {
+      event.preventDefault();
+      const button = document.getElementById("run-once");
+      button.disabled = true;
+      const form = new FormData(event.target);
+      const payload = {
+        source: form.get("source"),
+        symbol: form.get("symbol"),
+        target_dte: Number(form.get("target_dte")),
+        max_candidates: Number(form.get("max_candidates"))
+      };
+      try {
+        const result = await fetch(runUrl, {
+          method: "POST",
+          headers: {"Content-Type": "application/json"},
+          body: JSON.stringify(payload)
+        }).then(r => r.json());
+        document.getElementById("run-output").textContent = JSON.stringify(result, null, 2);
+        await loadAccountView();
+      } finally {
+        button.disabled = false;
+      }
+    });
+    loadAccountView();
   </script>
 </body>
 </html>

@@ -20,9 +20,13 @@ dev = [
 tastytrade = [
     "tastytrade>=10.3.0",
 ]
+desktop = [
+    "pyinstaller>=6.0",
+]
 
 [project.scripts]
 trading-bot = "trading_bot.cli:main"
+trading-bot-desktop = "trading_bot.desktop:main"
 
 [tool.setuptools.packages.find]
 where = ["src"]

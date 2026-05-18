@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import asyncio
+import inspect
 import os
 from collections.abc import Callable, Mapping, Sequence
 from dataclasses import dataclass
@@ -36,6 +37,8 @@ class TastytradeSdkDataSource:
         username: str,
         password: str,
         *,
+        provider_secret: str | None = None,
+        refresh_token: str | None = None,
         is_test: bool = True,
         quote_timeout_seconds: float = 8.0,
         max_contracts: int = 120,
@@ -47,12 +50,15 @@ class TastytradeSdkDataSource:
     ) -> None:
         self.source_name = "tastytrade_sdk"
 
-        if not username or not password:
+        if not (username and password) and not (provider_secret and refresh_token):
             raise TastytradeDataError(
-                "TASTYTRADE_USERNAME and TASTYTRADE_PASSWORD are required for source=tastytrade."
+                "TASTYTRADE OAuth credentials or username/password are required for "
+                "source=tastytrade."
             )
         self.username = username
         self.password = password
+        self.provider_secret = provider_secret
+        self.refresh_token = refresh_token
         self.is_test = is_test
         self.quote_timeout_seconds = quote_timeout_seconds
         self.max_contracts = max_contracts
@@ -74,25 +80,34 @@ class TastytradeSdkDataSource:
         return cls(
             username=values.get("TASTYTRADE_USERNAME", ""),
             password=values.get("TASTYTRADE_PASSWORD", ""),
+            provider_secret=(values.get("TASTYTRADE_PROVIDER_SECRET") or values.get("TT_SECRET")),
+            refresh_token=(values.get("TASTYTRADE_REFRESH_TOKEN") or values.get("TT_REFRESH")),
             is_test=_parse_bool(values.get("TASTYTRADE_IS_TEST", "true")),
             quote_timeout_seconds=quote_timeout_seconds,
             max_contracts=max_contracts,
         )
 
     def fetch_snapshot(self, symbol: str, target_dte: int) -> TastytradeMarketSnapshot:
+        return asyncio.run(self._fetch_snapshot_async(symbol, target_dte))
+
+    async def _fetch_snapshot_async(
+        self,
+        symbol: str,
+        target_dte: int,
+    ) -> TastytradeMarketSnapshot:
         sdk = self._load_sdk()
-        session = sdk["Session"](self.username, self.password, is_test=self.is_test)
-        chain = sdk["get_option_chain"](session, symbol.upper())
-        expiration, options = _select_expiration(chain, target_dte)
-        selected_options = _limit_contract_count(options, self.max_contracts)
-        streamer_symbols = [
-            option.streamer_symbol
-            for option in selected_options
-            if getattr(option, "streamer_symbol", None)
-        ]
-        underlying_symbol = symbol.upper()
-        quotes, greeks = asyncio.run(
-            self._fetch_quotes_and_greeks(
+        session = self._create_session(sdk["Session"])
+        try:
+            chain = await _await_if_needed(sdk["get_option_chain"](session, symbol.upper()))
+            expiration, options = _select_expiration(chain, target_dte)
+            selected_options = _limit_contract_count(options, self.max_contracts)
+            streamer_symbols = [
+                option.streamer_symbol
+                for option in selected_options
+                if getattr(option, "streamer_symbol", None)
+            ]
+            underlying_symbol = symbol.upper()
+            quotes, greeks = await self._fetch_quotes_and_greeks(
                 session=session,
                 streamer_factory=sdk["DXLinkStreamer"],
                 quote_class=sdk["Quote"],
@@ -100,16 +115,29 @@ class TastytradeSdkDataSource:
                 symbols=(underlying_symbol, *streamer_symbols),
                 greek_symbols=tuple(streamer_symbols),
             )
-        )
-        contracts = contracts_from_sdk_options(selected_options, quotes, greeks)
-        underlying_quote = underlying_quote_from_streamer(underlying_symbol, quotes)
-        return TastytradeMarketSnapshot(
-            symbol=underlying_symbol,
-            expiration=expiration,
-            dte=max(0, (expiration - date.today()).days),
-            underlying_quote=underlying_quote,
-            option_contracts=tuple(contracts),
-        )
+            contracts = contracts_from_sdk_options(selected_options, quotes, greeks)
+            underlying_quote = underlying_quote_from_streamer(underlying_symbol, quotes)
+            return TastytradeMarketSnapshot(
+                symbol=underlying_symbol,
+                expiration=expiration,
+                dte=max(0, (expiration - date.today()).days),
+                underlying_quote=underlying_quote,
+                option_contracts=tuple(contracts),
+            )
+        finally:
+            client = getattr(session, "_client", None)
+            close = getattr(client, "aclose", None)
+            if close is not None:
+                await close()
+
+    def _create_session(self, session_factory: Callable[..., Any]) -> Any:
+        if self.session_factory is None and self.provider_secret and self.refresh_token:
+            return session_factory(
+                provider_secret=self.provider_secret,
+                refresh_token=self.refresh_token,
+                is_test=self.is_test,
+            )
+        return session_factory(self.username, self.password, is_test=self.is_test)
 
     def _load_sdk(self) -> dict[str, Any]:
         if (
@@ -271,6 +299,12 @@ def _select_expiration(
     today = date.today()
     expiration = min(chain, key=lambda item: abs((item - today).days - target_dte))
     return expiration, chain[expiration]
+
+
+async def _await_if_needed(value: Any) -> Any:
+    if inspect.isawaitable(value):
+        return await value
+    return value
 
 
 def _limit_contract_count(options: Sequence[Any], max_contracts: int) -> list[Any]:

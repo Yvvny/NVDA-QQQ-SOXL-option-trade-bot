@@ -6,7 +6,9 @@ from collections.abc import Sequence
 from dataclasses import asdict
 
 from trading_bot.api import UiServerConfig, run_ui_server
+from trading_bot.broker import fetch_tastytrade_account_snapshot
 from trading_bot.config.settings import load_settings
+from trading_bot.paper import DEFAULT_PAPER_STATE_PATH, PaperTradingSimulator
 from trading_bot.runner import DryRunBotRunner
 
 
@@ -19,12 +21,37 @@ def build_parser() -> argparse.ArgumentParser:
 
     subparsers.add_parser("config", help="Print the effective bot configuration as JSON.")
     subparsers.add_parser("status", help="Print the current system mode and safety defaults.")
+    account = subparsers.add_parser(
+        "account",
+        help="Print read-only tastytrade account status as JSON.",
+    )
+    account.add_argument(
+        "--summary",
+        action="store_true",
+        help="Print a compact masked summary instead of full balance/position details.",
+    )
 
     run_once = subparsers.add_parser("run-once", help="Run one safe dry-run scan cycle.")
     _add_run_arguments(run_once, include_loop_arguments=False)
 
     run = subparsers.add_parser("run", help="Run repeated safe dry-run scan cycles.")
     _add_run_arguments(run, include_loop_arguments=True)
+
+    paper_status = subparsers.add_parser("paper-status", help="Print virtual paper account status.")
+    paper_status.add_argument(
+        "--state-path",
+        default=str(DEFAULT_PAPER_STATE_PATH),
+        help="Path to the virtual paper account JSON state.",
+    )
+
+    paper_once = subparsers.add_parser("paper-once", help="Run one virtual paper cycle.")
+    _add_paper_arguments(paper_once, include_loop_arguments=False)
+
+    paper_run = subparsers.add_parser(
+        "paper-run",
+        help="Run repeated virtual paper cycles. Use --days 30 for a one-month trial.",
+    )
+    _add_paper_arguments(paper_run, include_loop_arguments=True)
 
     ui = subparsers.add_parser("ui", help="Start the local safe dry-run web UI.")
     ui.add_argument("--host", default="127.0.0.1", help="Host interface for the local UI.")
@@ -54,6 +81,12 @@ def main(argv: Sequence[str] | None = None) -> int:
             "allow_naked_options": settings.forbidden.allow_naked_options,
             "allow_market_orders_options": settings.forbidden.allow_market_orders_options,
         }
+        print(json.dumps(payload, indent=2, sort_keys=True))
+        return 0
+
+    if args.command == "account":
+        snapshot = fetch_tastytrade_account_snapshot()
+        payload = _account_summary(snapshot) if args.summary else asdict(snapshot)
         print(json.dumps(payload, indent=2, sort_keys=True))
         return 0
 
@@ -94,6 +127,27 @@ def main(argv: Sequence[str] | None = None) -> int:
             max_contracts=args.max_contracts,
         )
         results = runner.run(cycles=args.cycles, interval_seconds=args.interval_seconds)
+        print(json.dumps([result.to_dict() for result in results], indent=2, sort_keys=True))
+        return 0
+
+    if args.command == "paper-status":
+        simulator = PaperTradingSimulator(state_path=args.state_path)
+        print(json.dumps(simulator.load_state().to_summary(), indent=2, sort_keys=True))
+        return 0
+
+    if args.command == "paper-once":
+        simulator = _paper_simulator_from_args(args, settings)
+        result = simulator.run_once()
+        print(json.dumps(result.to_dict(), indent=2, sort_keys=True))
+        return 0
+
+    if args.command == "paper-run":
+        simulator = _paper_simulator_from_args(args, settings)
+        results = simulator.run(
+            cycles=args.cycles,
+            interval_seconds=args.interval_seconds,
+            days=args.days,
+        )
         print(json.dumps([result.to_dict() for result in results], indent=2, sort_keys=True))
         return 0
 
@@ -155,3 +209,78 @@ def _add_run_arguments(parser: argparse.ArgumentParser, include_loop_arguments: 
             default=60.0,
             help="Seconds to wait between cycles.",
         )
+
+
+def _account_summary(snapshot) -> dict[str, object]:
+    balances = snapshot.balances or {}
+    return {
+        "connected": snapshot.connected,
+        "source": snapshot.source,
+        "is_test": snapshot.is_test,
+        "account_number_masked": snapshot.account_number_masked,
+        "account_type_name": snapshot.account_type_name,
+        "margin_or_cash": snapshot.margin_or_cash,
+        "net_liquidating_value": balances.get("net_liquidating_value"),
+        "cash_balance": balances.get("cash_balance"),
+        "derivative_buying_power": balances.get("derivative_buying_power"),
+        "positions_count": len(snapshot.positions or []),
+        "error_type": snapshot.error_type,
+        "message": snapshot.message,
+    }
+
+
+def _add_paper_arguments(parser: argparse.ArgumentParser, include_loop_arguments: bool) -> None:
+    parser.add_argument(
+        "--source",
+        choices=["mock", "tastytrade"],
+        default="mock",
+        help="Data source for virtual paper trading.",
+    )
+    parser.add_argument(
+        "--symbols",
+        default="QQQ",
+        help="Comma-separated symbols to scan, for example QQQ,NVDA,SOXL.",
+    )
+    parser.add_argument("--target-dte", type=int, default=30)
+    parser.add_argument("--max-candidates", type=int, default=1)
+    parser.add_argument("--starting-equity", type=float, default=2000.0)
+    parser.add_argument("--state-path", default=str(DEFAULT_PAPER_STATE_PATH))
+    parser.add_argument("--audit-log", default="docs/reports/paper_audit.jsonl")
+    parser.add_argument("--quote-timeout-seconds", type=float, default=8.0)
+    parser.add_argument("--max-contracts", type=int, default=120)
+    parser.add_argument(
+        "--strict-spec",
+        action="store_true",
+        help="Apply the strategy spec compliance gate before virtual paper entries.",
+    )
+    if include_loop_arguments:
+        parser.add_argument(
+            "--cycles",
+            type=int,
+            default=1,
+            help="Number of cycles. Use 0 to run until stopped or --days is reached.",
+        )
+        parser.add_argument("--interval-seconds", type=float, default=300.0)
+        parser.add_argument(
+            "--days",
+            type=float,
+            default=None,
+            help="Optional number of days to run, for example 30.",
+        )
+
+
+def _paper_simulator_from_args(args, settings) -> PaperTradingSimulator:
+    symbols = tuple(symbol.strip().upper() for symbol in args.symbols.split(",") if symbol.strip())
+    return PaperTradingSimulator(
+        settings=settings,
+        source=args.source,
+        symbols=symbols,
+        target_dte=args.target_dte,
+        max_candidates_per_symbol=args.max_candidates,
+        state_path=args.state_path,
+        audit_log_path=args.audit_log,
+        starting_equity=args.starting_equity,
+        quote_timeout_seconds=args.quote_timeout_seconds,
+        max_contracts=args.max_contracts,
+        strict_spec=args.strict_spec,
+    )

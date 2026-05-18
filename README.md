@@ -42,7 +42,59 @@ Start the local control UI:
 ```
 
 Then open `http://127.0.0.1:8765`. The UI can view safety status, read recent audit records,
-and trigger one dry-run scan. It does not expose live order submission.
+trigger one dry-run scan, and show read-only tastytrade account balances/positions when OAuth
+credentials are configured. It does not expose live order submission.
+
+For the account panel, set tastytrade SDK v12+ OAuth values in `.env` or your shell:
+
+```powershell
+$env:TASTYTRADE_PROVIDER_SECRET="your_provider_secret"
+$env:TASTYTRADE_REFRESH_TOKEN="your_refresh_token"
+$env:TASTYTRADE_ACCOUNT_NUMBER="your_account_number"
+$env:TASTYTRADE_IS_TEST="true"
+```
+
+The account panel calls the read-only SDK account endpoints for balances, positions with marks,
+and trading status. Account numbers are masked in the UI.
+
+## Windows Desktop Control App
+
+For a no-terminal control window during development, double-click:
+
+```text
+TradingBotControl.pyw
+```
+
+The desktop window can start/stop the local web UI, open it in your browser, run one dry-run scan,
+start/stop a repeated dry-run loop, and refresh the read-only tastytrade account status.
+
+To build a standalone Windows executable:
+
+```powershell
+.\.venv\Scripts\python.exe -m pip install -e ".[desktop,tastytrade]"
+.\.venv\Scripts\python.exe -m PyInstaller --noconsole --onefile --name TradingBotControl --paths src TradingBotControl.pyw
+```
+
+The generated executable is:
+
+```text
+dist\TradingBotControl.exe
+```
+
+Put a `.env` file next to the executable when running outside the repo.
+
+## Strict One-Month Paper Simulation
+
+Run a 30-day virtual account test with a $2,000 starting equity and the strategy-spec compliance
+gate enabled:
+
+```powershell
+.\.venv\Scripts\python.exe -m trading_bot paper-run --source tastytrade --symbols QQQ,NVDA,SOXL --starting-equity 2000 --cycles 0 --days 30 --interval-seconds 300 --strict-spec
+```
+
+`--strict-spec` applies the strategy-spec gate before paper entries. Hard rule failures reject the
+candidate; unavailable IV-rank/price-action context is recorded as a strict warning in
+`docs/reports/paper_audit.jsonl` so the 30-day result can be reviewed honestly.
 
 ## Tastytrade Read-Only Data
 

@@ -3,6 +3,7 @@ import threading
 import urllib.request
 
 from trading_bot.api import UiServerConfig, build_ui_server
+from trading_bot.api.server import _live_position_view
 from trading_bot.cli import build_parser
 
 
@@ -30,6 +31,8 @@ def test_ui_server_serves_status_and_runs_dry_run(tmp_path):
 
     try:
         status = _get_json(f"{base_url}/api/status")
+        account = _get_json(f"{base_url}/api/account")
+        paper_view = _get_json(f"{base_url}/api/account-view?type=paper")
         run_result = _post_json(
             f"{base_url}/api/run-once",
             {"source": "mock", "symbol": "QQQ", "target_dte": 30, "max_candidates": 1},
@@ -42,10 +45,46 @@ def test_ui_server_serves_status_and_runs_dry_run(tmp_path):
         thread.join(timeout=5)
 
     assert status["mode"] == "dry_run"
+    assert account["source"] == "tastytrade"
+    assert account["connected"] is False
+    assert paper_view["account_type"] == "paper"
+    assert paper_view["metrics"]["equity"] == 2000.0
     assert run_result["accepted"] == 1
     assert audit_path.exists()
     assert len(audit["records"]) == 1
     assert "Trading Bot Control" in html
+    assert "account-select" in html
+
+
+def test_live_position_view_labels_manual_and_bot_managed_positions():
+    position = {
+        "symbol": "QQQ   260619C00510000",
+        "instrument_type": "Equity Option",
+        "quantity": 1,
+        "quantity_direction": "Long",
+        "average_open_price": 3.2,
+        "mark_price": 1.63,
+        "mark": 163.0,
+    }
+
+    manual = _live_position_view(position, None)
+    bot_managed = _live_position_view(
+        position,
+        {
+            "strategy_name": "call_debit_spread",
+            "entry_score": 82,
+            "max_loss": 150,
+            "exit_plan": {"profit_target_pct": 50},
+        },
+    )
+
+    assert manual["managed_by"] == "Manual / External"
+    assert manual["strategy"] == "Manual / External"
+    assert manual["entry_score"] is None
+    assert bot_managed["managed_by"] == "Bot"
+    assert bot_managed["strategy"] == "call_debit_spread"
+    assert bot_managed["entry_score"] == 82
+    assert bot_managed["max_loss"] == 150
 
 
 def _get_json(url: str):

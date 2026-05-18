@@ -8,7 +8,6 @@ from pathlib import Path
 from trading_bot.config.settings import BotSettings, load_settings
 from trading_bot.core.enums import OptionType
 from trading_bot.core.models import OptionContract
-from trading_bot.data.market_data import RetryingMarketDataProvider
 from trading_bot.data.tastytrade_source import TastytradeMarketSnapshot, TastytradeSdkDataSource
 from trading_bot.execution.dry_run import DryRunExecutionResult, DryRunExecutor
 from trading_bot.regime.classifier import MarketRegimeInput, RegimeClassifier, RegimeLabel
