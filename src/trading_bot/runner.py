@@ -13,6 +13,7 @@ from trading_bot.execution.dry_run import DryRunExecutionResult, DryRunExecutor
 from trading_bot.regime.classifier import MarketRegimeInput, RegimeClassifier, RegimeLabel
 from trading_bot.risk.portfolio import OpenPosition, PortfolioState
 from trading_bot.storage.audit import JsonlAuditLogger
+from trading_bot.strategies.diagnostics import build_scan_diagnostics
 from trading_bot.strategies.scoring import StrategyScoreInput
 from trading_bot.strategies.selector import StrategySelector
 
@@ -78,6 +79,25 @@ class DryRunBotRunner:
             underlying=snapshot.symbol,
             dte=snapshot.dte,
             score_inputs=score_inputs,
+        )
+        self.executor.audit_logger.record(
+            {
+                "event_type": "scan_diagnostics",
+                "cycle_index": cycle_index,
+                "source": self.source,
+                "diagnostics": build_scan_diagnostics(
+                    settings=self.settings,
+                    symbol=snapshot.symbol,
+                    expiration=snapshot.expiration,
+                    dte=snapshot.dte,
+                    underlying_quote=snapshot.underlying_quote,
+                    contracts=contracts,
+                    regime_label=regime_label,
+                    score_inputs=score_inputs,
+                    candidates=candidates,
+                    market_data_diagnostics=snapshot.market_data_diagnostics,
+                ),
+            }
         )
         portfolio_state = PortfolioState(account_equity=self.settings.account.assumed_equity)
         results: list[DryRunExecutionResult] = []

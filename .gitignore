@@ -1,4 +1,4 @@
-# Python
+# Python cache/build artifacts
 __pycache__/
 *.py[cod]
 *.pyo
@@ -6,7 +6,9 @@ __pycache__/
 .pytest_cache/
 .ruff_cache/
 .mypy_cache/
+.pyre/
 .coverage
+coverage.xml
 htmlcov/
 build/
 dist/
@@ -17,18 +19,31 @@ dist/
 venv/
 ENV/
 
-# Local secrets and runtime files
+# Local secrets
 .env
 .env.*
 !.env.example
+ui-auth.env
+
+# Runtime state, logs, and reports
 *.sqlite
 *.sqlite3
+*.db
+*.log
 logs/
-docs/reports/*.jsonl
-docs/reports/*.json
+docs/reports/*
+!docs/reports/.gitkeep
+
+# Deployment artifacts
+.deploy_tmp/
+trading-bot-deploy*.tar.gz
+trading-bot-deploy*.zip
+.tmp_deploy_remote.sh
+.tmp_*.sh
 
 # OS/editor
 .DS_Store
 Thumbs.db
+desktop.ini
 .idea/
 .vscode/

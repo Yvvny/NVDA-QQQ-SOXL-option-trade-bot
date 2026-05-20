@@ -23,12 +23,23 @@ class TastytradeSdkNotInstalledError(TastytradeDataError):
 
 
 @dataclass(frozen=True)
+class TastytradeMarketDataDiagnostics:
+    subscribed_option_contracts: int
+    received_option_quotes: int
+    received_greeks: int
+    required_option_quotes: int
+    required_greeks: int
+    market_data_incomplete: bool
+
+
+@dataclass(frozen=True)
 class TastytradeMarketSnapshot:
     symbol: str
     expiration: date
     dte: int
     underlying_quote: UnderlyingQuote | None
     option_contracts: tuple[OptionContract, ...]
+    market_data_diagnostics: TastytradeMarketDataDiagnostics | None = None
 
 
 class TastytradeSdkDataSource:
@@ -115,6 +126,12 @@ class TastytradeSdkDataSource:
                 symbols=(underlying_symbol, *streamer_symbols),
                 greek_symbols=tuple(streamer_symbols),
             )
+            required_events = _required_option_event_count(len(streamer_symbols))
+            received_option_quotes = _option_quote_count(
+                tuple(streamer_symbols),
+                quotes,
+            )
+            received_greeks = _greek_count(tuple(streamer_symbols), greeks)
             contracts = contracts_from_sdk_options(selected_options, quotes, greeks)
             underlying_quote = underlying_quote_from_streamer(underlying_symbol, quotes)
             return TastytradeMarketSnapshot(
@@ -123,6 +140,17 @@ class TastytradeSdkDataSource:
                 dte=max(0, (expiration - date.today()).days),
                 underlying_quote=underlying_quote,
                 option_contracts=tuple(contracts),
+                market_data_diagnostics=TastytradeMarketDataDiagnostics(
+                    subscribed_option_contracts=len(streamer_symbols),
+                    received_option_quotes=received_option_quotes,
+                    received_greeks=received_greeks,
+                    required_option_quotes=required_events,
+                    required_greeks=required_events,
+                    market_data_incomplete=(
+                        received_option_quotes < required_events
+                        or received_greeks < required_events
+                    ),
+                ),
             )
         finally:
             client = getattr(session, "_client", None)
@@ -191,12 +219,19 @@ class TastytradeSdkDataSource:
             if greek_symbols:
                 await streamer.subscribe(greeks_class, list(greek_symbols))
             deadline = asyncio.get_running_loop().time() + self.quote_timeout_seconds
+            required_option_events = _required_option_event_count(len(greek_symbols))
 
             while asyncio.get_running_loop().time() < deadline:
                 await _collect_event(streamer, quote_class, quotes, deadline)
                 if greek_symbols:
                     await _collect_event(streamer, greeks_class, greeks, deadline)
-                if _has_minimum_market_data(symbols, greek_symbols, quotes, greeks):
+                if _has_minimum_market_data(
+                    symbols,
+                    greek_symbols,
+                    quotes,
+                    greeks,
+                    required_option_events=required_option_events,
+                ):
                     break
 
         return quotes, greeks
@@ -283,11 +318,38 @@ def _has_minimum_market_data(
     greek_symbols: tuple[str, ...],
     quotes: Mapping[str, Any],
     greeks: Mapping[str, Any],
+    *,
+    required_option_events: int | None = None,
 ) -> bool:
     option_symbols = [symbol for symbol in symbols if symbol in greek_symbols]
-    option_quote_count = sum(1 for symbol in option_symbols if symbol in quotes)
-    greek_count = sum(1 for symbol in greek_symbols if symbol in greeks)
-    return option_quote_count >= 2 and greek_count >= 2
+    option_quote_count = _option_quote_count(tuple(option_symbols), quotes)
+    greek_count = _greek_count(greek_symbols, greeks)
+    required = (
+        required_option_events
+        if required_option_events is not None
+        else _required_option_event_count(len(greek_symbols))
+    )
+    return option_quote_count >= required and greek_count >= required
+
+
+def _required_option_event_count(option_symbol_count: int) -> int:
+    if option_symbol_count <= 0:
+        return 0
+    return min(30, option_symbol_count)
+
+
+def _option_quote_count(
+    option_symbols: tuple[str, ...],
+    quotes: Mapping[str, Any],
+) -> int:
+    return sum(1 for symbol in option_symbols if symbol in quotes)
+
+
+def _greek_count(
+    greek_symbols: tuple[str, ...],
+    greeks: Mapping[str, Any],
+) -> int:
+    return sum(1 for symbol in greek_symbols if symbol in greeks)
 
 
 def _select_expiration(

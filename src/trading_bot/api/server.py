@@ -1,15 +1,19 @@
 from __future__ import annotations
 
 # ruff: noqa: E501
+import base64
+import hmac
 import json
+import os
 from dataclasses import asdict, dataclass, is_dataclass
-from datetime import UTC, date, datetime
+from datetime import UTC, date, datetime, timedelta
 from enum import Enum
 from http import HTTPStatus
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 from pathlib import Path
 from typing import Any
 from urllib.parse import parse_qs, urlparse
+from zoneinfo import ZoneInfo
 
 from trading_bot.broker import fetch_tastytrade_account_snapshot
 from trading_bot.config.settings import load_settings
@@ -18,6 +22,7 @@ from trading_bot.runner import DryRunBotRunner
 
 DEFAULT_PAPER_AUDIT_LOG_PATH = "docs/reports/paper_audit.jsonl"
 DEFAULT_BOT_TRADE_JOURNAL_PATH = "docs/reports/bot_trade_journal.jsonl"
+NEW_YORK_TIME_ZONE = ZoneInfo("America/New_York")
 
 
 @dataclass(frozen=True)
@@ -52,6 +57,8 @@ class _TradingBotUiHandler(BaseHTTPRequestHandler):
     server_config = UiServerConfig()
 
     def do_GET(self) -> None:
+        if not self._require_auth():
+            return
         parsed = urlparse(self.path)
         if parsed.path == "/":
             self._send_html(_HTML)
@@ -78,6 +85,9 @@ class _TradingBotUiHandler(BaseHTTPRequestHandler):
                 PaperTradingSimulator(state_path=DEFAULT_PAPER_STATE_PATH).load_state().to_summary()
             )
             return
+        if parsed.path == "/api/paper-runtime":
+            self._send_json(_paper_runtime_payload())
+            return
         if parsed.path == "/api/logs":
             query = parse_qs(parsed.query)
             log_type = query.get("type", ["paper"])[0]
@@ -87,8 +97,18 @@ class _TradingBotUiHandler(BaseHTTPRequestHandler):
                 if log_type == "paper"
                 else self.server_config.audit_log_path
             )
+            records = (
+                _read_recent_paper_logs(path, limit)
+                if log_type == "paper"
+                else _read_recent_jsonl(path, limit)
+            )
             self._send_json(
-                {"type": log_type, "path": path, "records": _read_recent_jsonl(path, limit)}
+                {
+                    "type": log_type,
+                    "path": path,
+                    "timezone": "America/New_York",
+                    "records": records,
+                }
             )
             return
         if parsed.path == "/api/audit":
@@ -104,6 +124,8 @@ class _TradingBotUiHandler(BaseHTTPRequestHandler):
         self._send_json({"error": "not_found"}, status=HTTPStatus.NOT_FOUND)
 
     def do_POST(self) -> None:
+        if not self._require_auth():
+            return
         parsed = urlparse(self.path)
         if parsed.path == "/api/run-once":
             payload = self._read_json_body()
@@ -148,6 +170,21 @@ class _TradingBotUiHandler(BaseHTTPRequestHandler):
         self.end_headers()
         self.wfile.write(body)
 
+    def _require_auth(self) -> bool:
+        credentials = _ui_auth_credentials()
+        if credentials is None:
+            return True
+        if _authorization_matches(self.headers.get("Authorization"), credentials):
+            return True
+        self.send_response(HTTPStatus.UNAUTHORIZED.value)
+        self.send_header("WWW-Authenticate", 'Basic realm="Trading Bot Control"')
+        self.send_header("Content-Type", "text/plain; charset=utf-8")
+        body = b"Authentication required."
+        self.send_header("Content-Length", str(len(body)))
+        self.end_headers()
+        self.wfile.write(body)
+        return False
+
 
 def _run_once_from_payload(payload: dict[str, Any], audit_log_path: str):
     source = str(payload.get("source", "mock"))
@@ -170,6 +207,53 @@ def _run_once_from_payload(payload: dict[str, Any], audit_log_path: str):
     return runner.run_once()
 
 
+def _ui_auth_credentials() -> tuple[str, str] | None:
+    values = _merged_env()
+    username = values.get("UI_AUTH_USERNAME", "").strip()
+    password = values.get("UI_AUTH_PASSWORD", "")
+    if not username and not password:
+        return None
+    if not username or not password:
+        return ("", "")
+    return (username, password)
+
+
+def _authorization_matches(
+    authorization_header: str | None,
+    credentials: tuple[str, str],
+) -> bool:
+    username, password = credentials
+    if not username or not password:
+        return False
+    if not authorization_header or not authorization_header.startswith("Basic "):
+        return False
+    try:
+        decoded = base64.b64decode(authorization_header.removeprefix("Basic ")).decode("utf-8")
+    except (ValueError, UnicodeDecodeError):
+        return False
+    expected = f"{username}:{password}"
+    return hmac.compare_digest(decoded, expected)
+
+
+def _merged_env() -> dict[str, str]:
+    values = _read_dotenv(Path(".env"))
+    values.update(os.environ)
+    return values
+
+
+def _read_dotenv(path: Path) -> dict[str, str]:
+    if not path.exists():
+        return {}
+    values: dict[str, str] = {}
+    for line in path.read_text(encoding="utf-8").splitlines():
+        stripped = line.strip()
+        if not stripped or stripped.startswith("#") or "=" not in stripped:
+            continue
+        key, value = stripped.split("=", 1)
+        values[key.strip()] = value.strip().strip('"').strip("'")
+    return values
+
+
 def _status_payload(audit_log_path: str) -> dict[str, Any]:
     settings = load_settings()
     audit_path = Path(audit_log_path)
@@ -186,6 +270,7 @@ def _status_payload(audit_log_path: str) -> dict[str, Any]:
         "recent_audit_count": len(recent_records),
         "latest_status": recent_records[-1].get("status") if recent_records else None,
         "server_time": datetime.now(UTC).isoformat(),
+        "server_time_new_york": _ny_time_string(datetime.now(UTC).isoformat()),
     }
 
 
@@ -198,12 +283,15 @@ def _account_view_payload(account_type: str) -> dict[str, Any]:
 def _paper_account_view_payload() -> dict[str, Any]:
     state = PaperTradingSimulator(state_path=DEFAULT_PAPER_STATE_PATH).load_state()
     summary = state.to_summary()
+    runtime = _paper_runtime_payload()
     return {
         "account_type": "paper",
         "title": "Paper Account",
         "connected": True,
-        "message": "Virtual $2,000 strategy-spec simulation account.",
+        "message": runtime["message"],
         "updated_at": summary["updated_at"],
+        "updated_at_new_york": _ny_time_string(summary["updated_at"]),
+        "runtime": runtime,
         "metrics": {
             "equity": summary["equity"],
             "cash": summary["equity"],
@@ -250,8 +338,12 @@ def _paper_account_view_payload() -> dict[str, Any]:
             }
             for trade in state.closed_trades[-20:]
         ],
-        "details": summary,
-        "logs": _read_recent_jsonl(DEFAULT_PAPER_AUDIT_LOG_PATH, 20),
+        "details": {
+            **summary,
+            "updated_at_new_york": _ny_time_string(summary["updated_at"]),
+            "runtime": runtime,
+        },
+        "logs": _read_recent_paper_logs(DEFAULT_PAPER_AUDIT_LOG_PATH, 20),
     }
 
 
@@ -293,6 +385,7 @@ def _live_account_view_payload() -> dict[str, Any]:
                 "margin_or_cash": snapshot.margin_or_cash,
                 "day_trader_status": snapshot.day_trader_status,
                 "fetched_at": snapshot.fetched_at,
+                "fetched_at_new_york": _ny_time_string(snapshot.fetched_at),
                 "message": snapshot.message,
                 "error_type": snapshot.error_type,
             },
@@ -433,8 +526,116 @@ def _read_recent_jsonl(path: str | Path, limit: int) -> list[dict[str, Any]]:
         except json.JSONDecodeError:
             payload = {"raw": line, "parse_error": True}
         if isinstance(payload, dict):
+            if payload.get("logged_at"):
+                payload["logged_at_new_york"] = _ny_time_string(str(payload["logged_at"]))
             records.append(payload)
     return records
+
+
+def _read_recent_paper_logs(path: str | Path, limit: int) -> list[dict[str, Any]]:
+    records = _read_recent_jsonl(path, 1000)
+    relevant: list[dict[str, Any]] = []
+    pending: list[dict[str, Any]] = []
+    for record in records:
+        pending.append(record)
+        if record.get("event_type") != "paper_cycle":
+            continue
+        result = _nested_dict(record, "result")
+        state_path = result.get("state_path") if result else None
+        if _same_state_path(state_path, DEFAULT_PAPER_STATE_PATH):
+            relevant.extend(pending)
+        pending = []
+    return relevant[-limit:]
+
+
+def _paper_runtime_payload() -> dict[str, Any]:
+    records = _read_recent_paper_logs(DEFAULT_PAPER_AUDIT_LOG_PATH, 50)
+    cycles = [record for record in records if record.get("event_type") == "paper_cycle"]
+    latest = cycles[-1] if cycles else None
+    result = _nested_dict(latest, "result") if latest else None
+    logged_at = str(latest.get("logged_at")) if latest and latest.get("logged_at") else None
+    seconds_since = _seconds_since(logged_at)
+    interval_seconds = 300
+    is_recent = seconds_since is not None and seconds_since <= interval_seconds * 1.75
+    status = "running" if is_recent else "stale_or_stopped"
+    if latest is None:
+        status = "no_cycles_yet"
+
+    generated = result.get("generated_candidates") if result else None
+    opened = result.get("opened_positions") if result else None
+    rejected = result.get("rejected_candidates") if result else None
+    errors = result.get("errors") if result else []
+    message = "Paper runner is scanning every 5 minutes."
+    if status == "stale_or_stopped":
+        message = "Paper runner has not written a recent cycle; it may be stopped."
+    if status == "no_cycles_yet":
+        message = "Paper runner has not written any cycle yet."
+    if generated == 0 and status == "running":
+        message = "Paper runner is running, but no strategy-qualified candidates were generated."
+
+    return {
+        "status": status,
+        "is_running_recently": is_recent,
+        "last_cycle_at": logged_at,
+        "last_cycle_at_new_york": _ny_time_string(logged_at),
+        "seconds_since_last_cycle": seconds_since,
+        "expected_interval_seconds": interval_seconds,
+        "next_cycle_estimate_new_york": _next_cycle_time_string(logged_at, interval_seconds),
+        "cycle_index": result.get("cycle_index") if result else None,
+        "source": result.get("source") if result else None,
+        "symbols": result.get("symbols") if result else [],
+        "strict_spec": result.get("strict_spec") if result else None,
+        "generated_candidates": generated,
+        "opened_positions": opened,
+        "rejected_candidates": rejected,
+        "errors": errors or [],
+        "message": message,
+    }
+
+
+def _same_state_path(value: Any, expected: str | Path) -> bool:
+    if not value:
+        return False
+    normalized_value = str(value).replace("\\", "/").lower()
+    normalized_expected = Path(expected).as_posix().lower()
+    return normalized_value.endswith(normalized_expected)
+
+
+def _seconds_since(value: str | None) -> int | None:
+    timestamp = _parse_timestamp(value)
+    if timestamp is None:
+        return None
+    return max(0, int((datetime.now(UTC) - timestamp.astimezone(UTC)).total_seconds()))
+
+
+def _next_cycle_time_string(value: str | None, interval_seconds: int) -> str | None:
+    timestamp = _parse_timestamp(value)
+    if timestamp is None:
+        return None
+    return (
+        (timestamp.astimezone(UTC) + timedelta(seconds=interval_seconds))
+        .astimezone(NEW_YORK_TIME_ZONE)
+        .strftime("%Y-%m-%d %H:%M:%S %Z")
+    )
+
+
+def _parse_timestamp(value: str | None) -> datetime | None:
+    if not value:
+        return None
+    try:
+        timestamp = datetime.fromisoformat(value.replace("Z", "+00:00"))
+    except ValueError:
+        return None
+    if timestamp.tzinfo is None:
+        timestamp = timestamp.replace(tzinfo=UTC)
+    return timestamp
+
+
+def _ny_time_string(value: str | None) -> str | None:
+    timestamp = _parse_timestamp(value)
+    if timestamp is None:
+        return value
+    return timestamp.astimezone(NEW_YORK_TIME_ZONE).strftime("%Y-%m-%d %H:%M:%S %Z")
 
 
 def _int_from_query(
@@ -1078,6 +1279,16 @@ _HTML = """<!doctype html>
     </section>
 
     <section>
+      <h2>Paper Runner</h2>
+      <div class="grid">
+        <div class="metric"><div class="label">Runner Status</div><div id="runtime-status" class="value"></div></div>
+        <div class="metric"><div class="label">Last Cycle NY</div><div id="runtime-last-cycle" class="value"></div></div>
+        <div class="metric"><div class="label">Next Cycle Estimate</div><div id="runtime-next-cycle" class="value"></div></div>
+        <div class="metric"><div class="label">Last Scan Result</div><div id="runtime-last-result" class="value"></div></div>
+      </div>
+    </section>
+
+    <section>
       <h2>Account Overview</h2>
       <div class="grid">
         <div class="metric"><div class="label">Equity / Net Liq</div><div id="metric-equity" class="value"></div></div>
@@ -1179,6 +1390,23 @@ _HTML = """<!doctype html>
       return value === null || value === undefined || value === "" ? "N/A" : value;
     }
 
+    function timeNy(value) {
+      if (!value) return "N/A";
+      const parsed = new Date(value);
+      if (Number.isNaN(parsed.getTime())) return value;
+      return parsed.toLocaleString("en-US", {
+        timeZone: "America/New_York",
+        year: "numeric",
+        month: "2-digit",
+        day: "2-digit",
+        hour: "2-digit",
+        minute: "2-digit",
+        second: "2-digit",
+        hour12: false,
+        timeZoneName: "short"
+      });
+    }
+
     function safe(value) {
       return String(plain(value))
         .replaceAll("&", "&amp;")
@@ -1204,11 +1432,21 @@ _HTML = """<!doctype html>
 
     function renderAccountView(view) {
       const metrics = view.metrics || {};
+      const runtime = view.runtime || {};
       text("account-title", view.title || "Account");
       text("account-message", view.message || "");
       const pill = document.getElementById("connection-pill");
       pill.textContent = view.connected ? "connected" : "not connected";
       pill.className = "pill " + (view.connected ? "good" : "warn");
+
+      text("runtime-status", runtime.status || "N/A");
+      text("runtime-last-cycle", runtime.last_cycle_at_new_york || "N/A");
+      text("runtime-next-cycle", runtime.next_cycle_estimate_new_york || "N/A");
+      text("runtime-last-result", [
+        runtime.generated_candidates === undefined || runtime.generated_candidates === null ? "" : `generated ${runtime.generated_candidates}`,
+        runtime.opened_positions === undefined || runtime.opened_positions === null ? "" : `opened ${runtime.opened_positions}`,
+        runtime.rejected_candidates === undefined || runtime.rejected_candidates === null ? "" : `rejected ${runtime.rejected_candidates}`
+      ].filter(Boolean).join(" | ") || "N/A");
 
       text("metric-equity", money(metrics.equity));
       text("metric-cash", money(metrics.cash));
@@ -1275,7 +1513,7 @@ _HTML = """<!doctype html>
           summary.equity === undefined ? "" : `equity ${money(summary.equity)}`
         ].filter(Boolean).join(" | ");
         return `<tr>
-          <td>${safe(record.logged_at)}</td>
+          <td>${safe(record.logged_at_new_york || timeNy(record.logged_at))}</td>
           <td>${safe(record.event_type)}</td>
           <td>${safe(shortSummary || "see raw log below")}</td>
         </tr>`;

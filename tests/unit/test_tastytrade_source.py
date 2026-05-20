@@ -5,6 +5,8 @@ from decimal import Decimal
 from trading_bot.core.enums import OptionType
 from trading_bot.data.tastytrade_source import (
     TastytradeSdkDataSource,
+    _has_minimum_market_data,
+    _required_option_event_count,
     contracts_from_sdk_options,
     underlying_quote_from_streamer,
 )
@@ -66,6 +68,29 @@ def test_tastytrade_source_from_env_uses_explicit_mapping():
     assert source.username == "user"
     assert source.password == "pass"
     assert source.is_test is False
+
+
+def test_tastytrade_source_waits_for_meaningful_option_event_count():
+    greek_symbols = tuple(f".QQQ260619C{i}" for i in range(80))
+    quotes = {symbol: object() for symbol in greek_symbols[:29]}
+    greeks = {symbol: object() for symbol in greek_symbols[:30]}
+
+    assert _required_option_event_count(80) == 30
+    assert not _has_minimum_market_data(
+        ("QQQ", *greek_symbols),
+        greek_symbols,
+        quotes,
+        greeks,
+    )
+
+    quotes[greek_symbols[29]] = object()
+
+    assert _has_minimum_market_data(
+        ("QQQ", *greek_symbols),
+        greek_symbols,
+        quotes,
+        greeks,
+    )
 
 
 @dataclass(frozen=True)

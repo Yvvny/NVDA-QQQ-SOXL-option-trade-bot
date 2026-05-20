@@ -21,6 +21,7 @@ from trading_bot.runner import (
     _score_inputs_for_snapshot,
 )
 from trading_bot.storage.audit import JsonlAuditLogger
+from trading_bot.strategies.diagnostics import build_scan_diagnostics
 from trading_bot.strategies.selector import StrategySelector
 from trading_bot.strategies.spec_compliance import validate_candidate_against_strategy_spec
 
@@ -183,16 +184,37 @@ class PaperTradingSimulator:
                 closed += close_count
 
                 regime_label = _regime_label_for_snapshot(snapshot)
+                score_inputs = _score_inputs_for_snapshot(
+                    regime_label,
+                    snapshot.option_contracts,
+                )
                 candidates = self.selector.generate_candidates(
                     contracts=snapshot.option_contracts,
                     underlying=snapshot.symbol,
                     dte=snapshot.dte,
-                    score_inputs=_score_inputs_for_snapshot(
-                        regime_label,
-                        snapshot.option_contracts,
-                    ),
+                    score_inputs=score_inputs,
                 )
                 generated += len(candidates)
+                self._record(
+                    {
+                        "event_type": "paper_scan_diagnostics",
+                        "cycle_index": cycle_index,
+                        "source": self.source,
+                        "strict_spec": self.strict_spec,
+                        "diagnostics": build_scan_diagnostics(
+                            settings=self.settings,
+                            symbol=snapshot.symbol,
+                            expiration=snapshot.expiration,
+                            dte=snapshot.dte,
+                            underlying_quote=snapshot.underlying_quote,
+                            contracts=snapshot.option_contracts,
+                            regime_label=regime_label,
+                            score_inputs=score_inputs,
+                            candidates=candidates,
+                            market_data_diagnostics=snapshot.market_data_diagnostics,
+                        ),
+                    }
+                )
                 portfolio_state = _portfolio_state_from_paper(state)
 
                 for candidate in candidates[: self.max_candidates_per_symbol]:
