@@ -4,11 +4,19 @@ import argparse
 import json
 from collections.abc import Sequence
 from dataclasses import asdict
+from datetime import date
 
 from trading_bot.api import UiServerConfig, run_ui_server
 from trading_bot.broker import fetch_tastytrade_account_snapshot
 from trading_bot.config.settings import load_settings
 from trading_bot.paper import DEFAULT_PAPER_STATE_PATH, PaperTradingSimulator
+from trading_bot.research_bot import (
+    ChatGPTResearchExportWriter,
+    OpenAIResearchClient,
+    ResearchReportWriter,
+    ResearchReviewer,
+    build_research_input_from_audit_log,
+)
 from trading_bot.runner import DryRunBotRunner
 
 
@@ -52,6 +60,63 @@ def build_parser() -> argparse.ArgumentParser:
         help="Run repeated virtual paper cycles. Use --days 30 for a one-month trial.",
     )
     _add_paper_arguments(paper_run, include_loop_arguments=True)
+
+    research_review = subparsers.add_parser(
+        "research-review",
+        help="Generate a read-only JSON research report from paper audit logs.",
+    )
+    research_review.add_argument(
+        "--audit-log",
+        default="docs/reports/paper_audit.jsonl",
+        help="Paper audit JSONL path to review.",
+    )
+    research_review.add_argument(
+        "--date",
+        default=None,
+        help="UTC report date in YYYY-MM-DD format. Defaults to today's UTC date.",
+    )
+    research_review.add_argument(
+        "--output-dir",
+        default="docs/reports/research",
+        help="Directory where the JSON report will be written.",
+    )
+    research_review.add_argument(
+        "--model",
+        default=None,
+        help="OpenAI model to use. Defaults to OPENAI_RESEARCH_MODEL or gpt-5.5.",
+    )
+    research_review.add_argument(
+        "--max-records",
+        type=int,
+        default=1000,
+        help="Maximum recent audit records to read.",
+    )
+
+    research_export = subparsers.add_parser(
+        "research-export",
+        help="Export a ChatGPT Plus-ready Markdown research packet without API calls.",
+    )
+    research_export.add_argument(
+        "--audit-log",
+        default="docs/reports/paper_audit.jsonl",
+        help="Paper audit JSONL path to export.",
+    )
+    research_export.add_argument(
+        "--date",
+        default=None,
+        help="UTC report date in YYYY-MM-DD format. Defaults to today's UTC date.",
+    )
+    research_export.add_argument(
+        "--output-dir",
+        default="docs/reports/research",
+        help="Directory where the Markdown export will be written.",
+    )
+    research_export.add_argument(
+        "--max-records",
+        type=int,
+        default=1000,
+        help="Maximum recent audit records to read.",
+    )
 
     ui = subparsers.add_parser("ui", help="Start the local safe dry-run web UI.")
     ui.add_argument("--host", default="127.0.0.1", help="Host interface for the local UI.")
@@ -149,6 +214,31 @@ def main(argv: Sequence[str] | None = None) -> int:
             days=args.days,
         )
         print(json.dumps([result.to_dict() for result in results], indent=2, sort_keys=True))
+        return 0
+
+    if args.command == "research-review":
+        report_date = date.fromisoformat(args.date) if args.date else None
+        research_input = build_research_input_from_audit_log(
+            args.audit_log,
+            report_date=report_date,
+            max_records=args.max_records,
+        )
+        client = OpenAIResearchClient.from_env(model=args.model)
+        reviewer = ResearchReviewer(client, model=client.model)
+        artifact = reviewer.review_to_artifact(research_input)
+        output_path = ResearchReportWriter(args.output_dir).write(artifact)
+        print(json.dumps({"report_path": str(output_path)}, indent=2, sort_keys=True))
+        return 0
+
+    if args.command == "research-export":
+        report_date = date.fromisoformat(args.date) if args.date else None
+        research_input = build_research_input_from_audit_log(
+            args.audit_log,
+            report_date=report_date,
+            max_records=args.max_records,
+        )
+        output_path = ChatGPTResearchExportWriter(args.output_dir).write(research_input)
+        print(json.dumps({"export_path": str(output_path)}, indent=2, sort_keys=True))
         return 0
 
     parser.error(f"unknown command: {args.command}")

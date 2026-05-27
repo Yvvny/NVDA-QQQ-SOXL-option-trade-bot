@@ -24,6 +24,8 @@ python -m venv .venv
 .\.venv\Scripts\python.exe -m trading_bot run-once
 .\.venv\Scripts\python.exe -m trading_bot run --cycles 5 --interval-seconds 60
 .\.venv\Scripts\python.exe -m trading_bot ui --host 127.0.0.1 --port 8765
+.\.venv\Scripts\python.exe -m trading_bot research-export --date 2026-05-20
+.\.venv\Scripts\python.exe -m trading_bot research-review --date 2026-05-20
 .\.venv\Scripts\python.exe -m pytest
 .\.venv\Scripts\python.exe -m ruff check .
 .\.venv\Scripts\python.exe -m black --check .
@@ -95,6 +97,42 @@ gate enabled:
 `--strict-spec` applies the strategy-spec gate before paper entries. Hard rule failures reject the
 candidate; unavailable IV-rank/price-action context is recorded as a strict warning in
 `docs/reports/paper_audit.jsonl` so the 30-day result can be reviewed honestly.
+
+## Read-Only Research Review Bot
+
+The research tools read paper audit logs and write reports under `docs/reports/research/`.
+They are research-only: reports may propose hypotheses and backtest tasks, but they cannot modify
+strategy config, risk limits, position size, or live trading settings.
+
+For ChatGPT Plus manual analysis without API billing, export a Markdown packet and paste it into
+ChatGPT:
+
+```powershell
+.\.venv\Scripts\python.exe -m trading_bot research-export --date 2026-05-20
+```
+
+To download today's online ChatGPT export from the server to this local repo, run this from local
+PowerShell, not from inside the SSH session:
+
+```powershell
+.\tools\download_today_research_export.ps1
+```
+
+The script uses the New York date by default and saves to `docs\reports\research\`. To download a
+specific trading day:
+
+```powershell
+.\tools\download_today_research_export.ps1 -Date 2026-05-19
+```
+
+For automated JSON reports with OpenAI API billing, set an OpenAI API key in `.env` or your shell:
+
+
+```powershell
+$env:OPENAI_API_KEY="your_api_key"
+$env:OPENAI_RESEARCH_MODEL="gpt-5.5"
+.\.venv\Scripts\python.exe -m trading_bot research-review --date 2026-05-20
+```
 
 ## Tastytrade Read-Only Data
 
