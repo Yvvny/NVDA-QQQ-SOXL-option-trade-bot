@@ -15,6 +15,7 @@ class OpenPosition:
 @dataclass(frozen=True)
 class PortfolioState:
     account_equity: float
+    risk_budget_base: float | None = None
     open_positions: tuple[OpenPosition, ...] = field(default_factory=tuple)
     daily_realized_pnl: float = 0.0
     weekly_realized_pnl: float = 0.0
@@ -26,6 +27,12 @@ class PortfolioState:
     @property
     def total_open_max_loss(self) -> float:
         return sum(position.max_loss for position in self.open_positions)
+
+    @property
+    def available_cash(self) -> float:
+        if self.risk_budget_base is not None:
+            return max(0.0, self.risk_budget_base)
+        return max(0.0, self.account_equity - self.total_open_max_loss)
 
     def open_symbol_count(self, symbol: str) -> int:
         normalized = symbol.upper()

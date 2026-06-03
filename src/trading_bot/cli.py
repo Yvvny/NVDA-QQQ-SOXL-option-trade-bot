@@ -343,6 +343,14 @@ def _add_paper_arguments(parser: argparse.ArgumentParser, include_loop_arguments
         action="store_true",
         help="Apply the strategy spec compliance gate before virtual paper entries.",
     )
+    parser.add_argument(
+        "--paper-experimental",
+        action="store_true",
+        help=(
+            "Enable a small paper-only experimental whitelist for strict-spec validation. "
+            "This does not affect live trading behavior."
+        ),
+    )
     if include_loop_arguments:
         parser.add_argument(
             "--cycles",
@@ -373,4 +381,5 @@ def _paper_simulator_from_args(args, settings) -> PaperTradingSimulator:
         quote_timeout_seconds=args.quote_timeout_seconds,
         max_contracts=args.max_contracts,
         strict_spec=args.strict_spec,
+        paper_experimental=args.paper_experimental,
     )

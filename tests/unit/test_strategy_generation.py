@@ -3,6 +3,7 @@ from datetime import date
 from trading_bot.core.enums import OptionType
 from trading_bot.core.models import OptionContract
 from trading_bot.regime import RegimeLabel
+from trading_bot.strategies.base import contract_liquidity_warnings
 from trading_bot.strategies import (
     ShortPremiumEngine,
     StrategyScoreInput,
@@ -70,6 +71,35 @@ def test_put_credit_spread_candidate_has_correct_legs_and_max_loss():
     assert candidate.max_loss == 75
 
 
+def test_put_credit_spread_prefers_best_reward_risk_within_dynamic_budget():
+    score = score_strategy_setup(
+        StrategyScoreInput(
+            strategy_name="put_credit_spread",
+            regime_label=RegimeLabel.BULL_TREND_HIGH_IV,
+            iv_rank=None,
+            bid_ask_pct_of_mid=0.08,
+            volume=100,
+            open_interest=1000,
+        )
+    )
+
+    candidate = ShortPremiumEngine().generate_put_credit_spread(
+        contracts=[
+            _contract("put", 450, -0.25, 2.10, 2.20),
+            _contract("put", 449, -0.18, 1.75, 1.85),
+            _contract("put", 448, -0.10, 1.41, 1.51),
+            _contract("put", 447, -0.05, 1.35, 1.45),
+        ],
+        underlying="QQQ",
+        dte=30,
+        score=score,
+    )
+
+    assert candidate is not None
+    assert [leg.contract.strike for leg in candidate.legs] == [450, 448]
+    assert candidate.max_loss <= 400
+
+
 def test_call_credit_spread_candidate_has_correct_legs_and_max_loss():
     score = _score("call_credit_spread", RegimeLabel.BEAR_TREND_HIGH_IV)
 
@@ -108,6 +138,34 @@ def test_call_debit_spread_candidate_has_correct_legs_and_max_loss():
     assert [leg.contract.strike for leg in candidate.legs] == [450, 452]
     assert candidate.max_profit == 150
     assert candidate.max_loss == 50
+
+
+def test_call_debit_spread_prefers_best_reward_risk_within_dynamic_budget():
+    score = score_strategy_setup(
+        StrategyScoreInput(
+            strategy_name="call_debit_spread",
+            regime_label=RegimeLabel.RANGE_LOW_IV,
+            iv_rank=None,
+            bid_ask_pct_of_mid=0.08,
+            volume=100,
+            open_interest=1000,
+        )
+    )
+
+    candidate = TrendParticipationEngine().generate_call_debit_spread(
+        contracts=[
+            _contract("call", 220, 0.50, 8.45, 8.55),
+            _contract("call", 223, 0.35, 7.15, 7.25),
+            _contract("call", 240, 0.22, 2.95, 3.05),
+        ],
+        underlying="NVDA",
+        dte=29,
+        score=score,
+    )
+
+    assert candidate is not None
+    assert [leg.contract.strike for leg in candidate.legs] == [220, 223]
+    assert candidate.max_loss <= 400
 
 
 def test_put_debit_spread_candidate_has_correct_legs_and_max_loss():
@@ -183,6 +241,9 @@ def _contract(
     bid: float,
     ask: float,
     expiration: date = EXPIRATION,
+    volume: int | None = 100,
+    open_interest: int | None = 1000,
+    allow_missing_activity_data: bool = False,
 ) -> OptionContract:
     return OptionContract(
         symbol=f"QQQ {EXPIRATION.isoformat()} {strike} {option_type}",
@@ -194,8 +255,9 @@ def _contract(
         ask=ask,
         mid=(bid + ask) / 2,
         delta=delta,
-        volume=100,
-        open_interest=1000,
+        volume=volume,
+        open_interest=open_interest,
+        allow_missing_activity_data=allow_missing_activity_data,
     )
 
 
@@ -238,6 +300,60 @@ def test_short_premium_is_blocked_in_crash_regime_even_with_otherwise_good_score
 
     assert candidate is None
     assert "short_premium_blocked_crash_risk_off" in score.reason_codes
+
+
+def test_real_data_contracts_allow_missing_activity_metadata_without_liquidity_rejection():
+    warnings = contract_liquidity_warnings(
+        _contract(
+            "put",
+            450,
+            -0.25,
+            0.43,
+            0.47,
+            volume=None,
+            open_interest=None,
+            allow_missing_activity_data=True,
+        )
+    )
+
+    assert "missing_volume_metadata" in warnings
+    assert "missing_open_interest_metadata" in warnings
+    assert "low_or_missing_volume" not in warnings
+    assert "low_or_missing_open_interest" not in warnings
+
+
+def test_put_credit_spread_candidate_allows_missing_activity_metadata_for_real_data():
+    score = _score("put_credit_spread")
+
+    candidate = ShortPremiumEngine().generate_put_credit_spread(
+        contracts=[
+            _contract(
+                "put",
+                450,
+                -0.25,
+                0.43,
+                0.47,
+                volume=None,
+                open_interest=None,
+                allow_missing_activity_data=True,
+            ),
+            _contract(
+                "put",
+                449,
+                -0.10,
+                0.19,
+                0.21,
+                volume=None,
+                open_interest=None,
+                allow_missing_activity_data=True,
+            ),
+        ],
+        underlying="QQQ",
+        dte=30,
+        score=score,
+    )
+
+    assert candidate is not None
 
 
 def test_calendar_and_diagonal_spreads_are_defined_risk_debit_candidates():

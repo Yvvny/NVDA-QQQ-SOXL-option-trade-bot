@@ -161,6 +161,55 @@ def test_research_export_writes_chatgpt_markdown_without_api(tmp_path):
     assert "Trading Bot Research Export" in output_path.read_text(encoding="utf-8")
 
 
+def test_research_input_filters_by_new_york_calendar_day(tmp_path):
+    audit_path = tmp_path / "paper_audit.jsonl"
+    audit_path.write_text(
+        "\n".join(
+            [
+                json.dumps(
+                    {
+                        "event_type": "paper_scan_diagnostics",
+                        "logged_at": "2026-05-21T01:30:00+00:00",
+                        "diagnostics": {
+                            "symbol": "QQQ",
+                            "contracts": {"received": 30, "eligible": 10},
+                            "market_data": {
+                                "market_data_incomplete": False,
+                                "received_option_quotes": 30,
+                                "received_greeks": 30,
+                            },
+                            "liquidity_blocks": {},
+                            "reason_codes": ["candidate_generated"],
+                            "strategies": [],
+                        },
+                    }
+                ),
+                json.dumps(
+                    {
+                        "event_type": "paper_cycle",
+                        "logged_at": "2026-05-21T01:31:00+00:00",
+                        "result": {
+                            "generated_candidates": 1,
+                            "opened_positions": 1,
+                            "rejected_candidates": 0,
+                        },
+                    }
+                ),
+            ]
+        ),
+        encoding="utf-8",
+    )
+
+    research_input = build_research_input_from_audit_log(
+        audit_path,
+        report_date=date(2026, 5, 20),
+    )
+
+    assert research_input.scan_count == 1
+    assert research_input.cycle_count == 1
+    assert research_input.opened_positions == 1
+
+
 def _report_json() -> str:
     return json.dumps(
         {

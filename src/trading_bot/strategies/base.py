@@ -3,7 +3,14 @@ from __future__ import annotations
 from collections.abc import Sequence
 
 from trading_bot.config.settings import BotSettings, load_settings
-from trading_bot.core.models import OptionContract
+from trading_bot.core.models import OptionContract, StrategyCandidate
+
+NON_BLOCKING_LIQUIDITY_WARNINGS = frozenset(
+    {
+        "missing_volume_metadata",
+        "missing_open_interest_metadata",
+    }
+)
 
 
 class StrategyEngine:
@@ -14,7 +21,7 @@ class StrategyEngine:
         return [
             contract
             for contract in contracts
-            if not contract_liquidity_warnings(contract, self.settings)
+            if not blocking_liquidity_warnings(contract, self.settings)
         ]
 
 
@@ -43,15 +50,75 @@ def contract_liquidity_warnings(
     elif spread_pct > settings.liquidity.max_bid_ask_pct_of_mid:
         warnings.append("wide_bid_ask_spread")
 
-    if contract.volume is None or contract.volume < settings.liquidity.min_volume:
+    if contract.volume is None:
+        if contract.allow_missing_activity_data:
+            warnings.append("missing_volume_metadata")
+        else:
+            warnings.append("low_or_missing_volume")
+    elif contract.volume < settings.liquidity.min_volume:
         warnings.append("low_or_missing_volume")
-    if (
-        contract.open_interest is None
-        or contract.open_interest < settings.liquidity.min_open_interest
-    ):
+
+    if contract.open_interest is None:
+        if contract.allow_missing_activity_data:
+            warnings.append("missing_open_interest_metadata")
+        else:
+            warnings.append("low_or_missing_open_interest")
+    elif contract.open_interest < settings.liquidity.min_open_interest:
         warnings.append("low_or_missing_open_interest")
 
     if not settings.liquidity.allow_missing_greeks and contract.delta is None:
         warnings.append("missing_delta")
 
     return tuple(warnings)
+
+
+def blocking_liquidity_warnings(
+    contract: OptionContract,
+    settings: BotSettings | None = None,
+) -> tuple[str, ...]:
+    return tuple(
+        warning
+        for warning in contract_liquidity_warnings(contract, settings)
+        if warning not in NON_BLOCKING_LIQUIDITY_WARNINGS
+    )
+
+
+def candidate_quality_score(candidate: StrategyCandidate, risk_cap: float) -> tuple[float, ...]:
+    reward_risk = _reward_risk_ratio(candidate)
+    spread_quality = _spread_quality_score(candidate)
+    risk_utilization = _risk_utilization_score(candidate, risk_cap)
+    max_profit = candidate.max_profit or 0.0
+    max_loss = candidate.max_loss or float("inf")
+    return (
+        reward_risk,
+        candidate.entry_score / 100.0,
+        spread_quality,
+        risk_utilization,
+        max_profit,
+        -max_loss,
+    )
+
+
+def _reward_risk_ratio(candidate: StrategyCandidate) -> float:
+    if candidate.max_profit is None or candidate.max_loss is None or candidate.max_loss <= 0:
+        return 0.0
+    return candidate.max_profit / candidate.max_loss
+
+
+def _spread_quality_score(candidate: StrategyCandidate) -> float:
+    spread_pcts = [
+        spread_pct
+        for leg in candidate.legs
+        if (spread_pct := bid_ask_pct_of_mid(leg.contract)) is not None
+    ]
+    if not spread_pcts:
+        return 0.0
+    average_spread_pct = sum(spread_pcts) / len(spread_pcts)
+    return max(0.0, 1.0 - average_spread_pct)
+
+
+def _risk_utilization_score(candidate: StrategyCandidate, risk_cap: float) -> float:
+    if candidate.max_loss is None or candidate.max_loss <= 0 or risk_cap <= 0:
+        return 0.0
+    utilization = min(candidate.max_loss / risk_cap, 1.5)
+    return max(0.0, 1.0 - abs(utilization - 0.60))

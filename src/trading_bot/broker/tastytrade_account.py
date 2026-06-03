@@ -4,11 +4,12 @@ import asyncio
 import os
 from collections.abc import Callable, Mapping
 from dataclasses import dataclass
-from datetime import UTC, datetime
+from datetime import datetime
 from decimal import Decimal
 from pathlib import Path
 from typing import Any
 
+from trading_bot.core.time_utils import iso_now_new_york
 
 class TastytradeAccountError(RuntimeError):
     pass
@@ -77,7 +78,7 @@ class TastytradeAccountSnapshot:
             connected=False,
             source="tastytrade",
             is_test=is_test,
-            fetched_at=datetime.now(UTC).isoformat(),
+            fetched_at=iso_now_new_york(),
             error_type=error.__class__.__name__,
             message=str(error),
             balances={},
@@ -129,7 +130,7 @@ class TastytradeAccountDataSource:
                 connected=True,
                 source="tastytrade",
                 is_test=self.credentials.is_test,
-                fetched_at=datetime.now(UTC).isoformat(),
+                fetched_at=iso_now_new_york(),
                 account_number=None,
                 account_number_masked=_mask_account_number(account_number),
                 account_type_name=_optional_str(getattr(account, "account_type_name", None)),

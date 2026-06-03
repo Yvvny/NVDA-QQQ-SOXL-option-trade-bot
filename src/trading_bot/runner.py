@@ -79,6 +79,7 @@ class DryRunBotRunner:
             underlying=snapshot.symbol,
             dte=snapshot.dte,
             score_inputs=score_inputs,
+            risk_budget_base=self.settings.account.assumed_equity,
         )
         self.executor.audit_logger.record(
             {
@@ -108,6 +109,10 @@ class DryRunBotRunner:
             if result.risk_decision.approved and candidate.max_loss is not None:
                 portfolio_state = PortfolioState(
                     account_equity=portfolio_state.account_equity,
+                    risk_budget_base=max(
+                        0.0,
+                        portfolio_state.available_cash - (candidate.max_loss or 0.0),
+                    ),
                     open_positions=(
                         *portfolio_state.open_positions,
                         OpenPosition(

@@ -45,6 +45,7 @@ class OptionContract:
     iv: float | None = None
     volume: int | None = None
     open_interest: int | None = None
+    allow_missing_activity_data: bool = False
 
     def effective_mid(self) -> float | None:
         if self.mid is not None:

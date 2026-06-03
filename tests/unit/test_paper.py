@@ -29,6 +29,7 @@ def test_paper_simulator_opens_virtual_position_and_persists_state(tmp_path):
     assert len(state.open_positions) == 1
     assert state.to_summary()["open_positions"] == 1
     assert state.to_summary()["equity"] == 2000
+    assert state.to_summary()["available_cash"] == 1925
 
 
 def test_paper_status_cli_reads_virtual_state(tmp_path, capsys):
@@ -46,6 +47,18 @@ def test_paper_status_cli_reads_virtual_state(tmp_path, capsys):
     assert exit_code == 0
     assert '"starting_equity": 2000.0' in output
     assert '"open_positions": 1' in output
+
+
+def test_paper_state_timestamps_are_new_york_offset(tmp_path):
+    state_path = tmp_path / "paper.json"
+    audit_path = tmp_path / "paper.jsonl"
+    state = PaperTradingSimulator(
+        source="mock",
+        state_path=state_path,
+        audit_log_path=audit_path,
+    ).run_once().summary
+
+    assert state["updated_at"].endswith("-04:00") or state["updated_at"].endswith("-05:00")
 
 
 def test_paper_once_cli_writes_virtual_state(tmp_path, capsys):
@@ -87,6 +100,29 @@ def test_strict_spec_paper_mode_records_spec_warnings(tmp_path):
     assert result.strict_spec is True
     assert result.opened_positions == 1
     assert "paper_candidate_spec_warning" in audit_text
+
+
+def test_paper_cli_allows_experimental_flag(tmp_path, capsys):
+    state_path = tmp_path / "paper.json"
+    audit_path = tmp_path / "paper.jsonl"
+
+    exit_code = main(
+        [
+            "paper-once",
+            "--source",
+            "mock",
+            "--state-path",
+            str(state_path),
+            "--audit-log",
+            str(audit_path),
+            "--strict-spec",
+            "--paper-experimental",
+        ]
+    )
+    output = capsys.readouterr().out
+
+    assert exit_code == 0
+    assert '"strict_spec": true' in output.lower()
 
 
 def test_paper_mode_records_scan_diagnostics_for_no_candidate_cycle(tmp_path):

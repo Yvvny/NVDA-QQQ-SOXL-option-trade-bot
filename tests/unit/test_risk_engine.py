@@ -79,14 +79,23 @@ def test_rejects_missing_exit_plan():
 
 
 def test_rejects_excessive_per_trade_risk():
-    decision = RiskEngine().evaluate(_candidate(max_loss=175, entry_score=70), _portfolio())
+    decision = RiskEngine().evaluate(_candidate(max_loss=450, entry_score=70), _portfolio())
+
+    assert decision.approved is False
+    assert REASON_PER_TRADE_MAX_LOSS_EXCEEDED in decision.reason_codes
+
+
+def test_rejects_trade_when_available_cash_budget_is_smaller_than_equity_budget():
+    portfolio = _portfolio(open_positions=(OpenPosition("QQQ", "put_credit_spread", 300),))
+
+    decision = RiskEngine().evaluate(_candidate(max_loss=350, entry_score=70), portfolio)
 
     assert decision.approved is False
     assert REASON_PER_TRADE_MAX_LOSS_EXCEEDED in decision.reason_codes
 
 
 def test_high_score_can_use_high_score_per_trade_limit():
-    decision = RiskEngine().evaluate(_candidate(max_loss=175, entry_score=85), _portfolio())
+    decision = RiskEngine().evaluate(_candidate(max_loss=450, entry_score=85), _portfolio())
 
     assert decision.approved is True
     assert decision.reason_codes == (REASON_APPROVED,)
@@ -103,7 +112,7 @@ def test_rejects_soxl_trade_above_soxl_cap():
 
 
 def test_rejects_excessive_total_open_risk():
-    portfolio = _portfolio(open_positions=(OpenPosition("QQQ", "put_credit_spread", 650),))
+    portfolio = _portfolio(open_positions=(OpenPosition("QQQ", "put_credit_spread", 950),))
 
     decision = RiskEngine().evaluate(_candidate(max_loss=100), portfolio)
 

@@ -20,10 +20,10 @@ class AccountConfig:
 @dataclass(frozen=True)
 class RiskConfig:
     default_mode: ExecutionMode = "dry_run"
-    per_trade_max_loss_default: float = 150.0
-    per_trade_max_loss_high_score: float = 200.0
+    per_trade_max_loss_pct_default: float = 0.20
+    per_trade_max_loss_pct_high_score: float = 0.40
     soxl_per_trade_max_loss: float = 150.0
-    total_open_max_loss_pct: float = 0.35
+    total_open_max_loss_pct: float = 0.50
     daily_loss_limit: float = 200.0
     weekly_loss_limit: float = 400.0
     max_consecutive_losses: int = 3
@@ -40,6 +40,14 @@ class RiskConfig:
                 f"Unsupported execution mode {self.default_mode!r}. "
                 f"Early versions allow only: {allowed}."
             )
+
+    def per_trade_max_loss_cap(self, risk_budget_base: float, entry_score: float) -> float:
+        pct_cap = (
+            self.per_trade_max_loss_pct_high_score
+            if entry_score >= 80
+            else self.per_trade_max_loss_pct_default
+        )
+        return risk_budget_base * pct_cap
 
 
 @dataclass(frozen=True)

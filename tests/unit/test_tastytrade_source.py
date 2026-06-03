@@ -44,6 +44,7 @@ def test_contracts_from_sdk_options_maps_quotes_and_greeks():
     assert contracts[0].mid == 0.5
     assert contracts[0].delta == -0.25
     assert contracts[0].iv == 0.40
+    assert contracts[0].allow_missing_activity_data is True
 
 
 def test_underlying_quote_from_streamer_maps_bid_ask_to_last_mid():
@@ -54,6 +55,8 @@ def test_underlying_quote_from_streamer_maps_bid_ask_to_last_mid():
     assert underlying_quote is not None
     assert underlying_quote.symbol == "QQQ"
     assert underlying_quote.last == 510.1
+    assert underlying_quote.timestamp.tzinfo is not None
+    assert underlying_quote.timestamp.isoformat().endswith("-04:00") or underlying_quote.timestamp.isoformat().endswith("-05:00")
 
 
 def test_tastytrade_source_from_env_uses_explicit_mapping():

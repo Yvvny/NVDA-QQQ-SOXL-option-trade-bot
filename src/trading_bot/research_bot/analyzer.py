@@ -3,9 +3,11 @@ from __future__ import annotations
 import json
 from collections import Counter, defaultdict
 from dataclasses import dataclass
-from datetime import UTC, date, datetime
+from datetime import UTC, date
 from pathlib import Path
 from typing import Any
+
+from trading_bot.core.time_utils import NEW_YORK_TIME_ZONE, parse_timestamp, today_new_york
 
 
 @dataclass(frozen=True)
@@ -48,7 +50,7 @@ def build_research_input_from_audit_log(
     report_date: date | None = None,
     max_records: int = 1000,
 ) -> ResearchInput:
-    report_date = report_date or datetime.now(UTC).date()
+    report_date = report_date or today_new_york()
     records = _read_jsonl(Path(audit_log_path), max_records=max_records)
     filtered = [
         record
@@ -163,11 +165,10 @@ def _record_date(record: dict[str, Any]) -> date | None:
     logged_at = record.get("logged_at")
     if not isinstance(logged_at, str):
         return None
-    normalized = logged_at.replace("Z", "+00:00")
-    try:
-        return datetime.fromisoformat(normalized).date()
-    except ValueError:
+    timestamp = parse_timestamp(logged_at, naive_timezone=UTC)
+    if timestamp is None:
         return None
+    return timestamp.astimezone(NEW_YORK_TIME_ZONE).date()
 
 
 def _empty_symbol_summary() -> dict[str, Any]:

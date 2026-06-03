@@ -3,12 +3,17 @@ from __future__ import annotations
 import time
 from collections.abc import Callable, Sequence
 from dataclasses import dataclass, replace
-from datetime import UTC, datetime
+from datetime import datetime
 from typing import Protocol
 
 from trading_bot.config.settings import BotSettings, load_settings
+from trading_bot.core.time_utils import now_new_york
 from trading_bot.core.models import OptionContract, UnderlyingQuote
-from trading_bot.strategies.base import bid_ask_pct_of_mid, contract_liquidity_warnings
+from trading_bot.strategies.base import (
+    bid_ask_pct_of_mid,
+    blocking_liquidity_warnings,
+    contract_liquidity_warnings,
+)
 
 
 class MarketDataError(RuntimeError):
@@ -59,7 +64,7 @@ class RetryingMarketDataProvider:
         self.settings = settings or load_settings()
         self.attempts = attempts
         self.retry_delay_seconds = retry_delay_seconds
-        self.now = now or (lambda: datetime.now(UTC))
+        self.now = now or now_new_york
 
     def fetch_snapshot(self, symbol: str, target_dte: int) -> MarketDataSnapshot:
         errors: list[str] = []
@@ -108,7 +113,7 @@ class CachedMarketDataProvider:
             raise ValueError("ttl_seconds cannot be negative.")
         self.provider = provider
         self.ttl_seconds = ttl_seconds
-        self.now = now or (lambda: datetime.now(UTC))
+        self.now = now or now_new_york
         self._cache: dict[tuple[str, int], tuple[datetime, MarketDataSnapshot]] = {}
 
     def fetch_snapshot(self, symbol: str, target_dte: int) -> MarketDataSnapshot:
@@ -136,7 +141,7 @@ def normalize_snapshot(
     source: str,
     now: Callable[[], datetime] | None = None,
 ) -> MarketDataSnapshot:
-    current_time = (now or (lambda: datetime.now(UTC)))()
+    current_time = (now or now_new_york)()
     if isinstance(snapshot, MarketDataSnapshot):
         if snapshot.captured_at is not None:
             return snapshot
@@ -203,5 +208,5 @@ def _liquid_contracts(
     return tuple(
         contract
         for contract in contracts
-        if not contract_liquidity_warnings(contract, settings)
+        if not blocking_liquidity_warnings(contract, settings)
     )

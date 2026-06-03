@@ -3,10 +3,10 @@ account:
 
 risk:
   default_mode: dry_run
-  per_trade_max_loss_default: 150
-  per_trade_max_loss_high_score: 200
+  per_trade_max_loss_pct_default: 0.20
+  per_trade_max_loss_pct_high_score: 0.40
   soxl_per_trade_max_loss: 150
-  total_open_max_loss_pct: 0.35
+  total_open_max_loss_pct: 0.50
   daily_loss_limit: 200
   weekly_loss_limit: 400
   max_consecutive_losses: 3

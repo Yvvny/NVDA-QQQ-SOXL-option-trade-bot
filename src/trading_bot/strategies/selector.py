@@ -5,6 +5,7 @@ from collections.abc import Iterable, Sequence
 from trading_bot.config.settings import BotSettings, load_settings
 from trading_bot.core.models import OptionContract, StrategyCandidate
 from trading_bot.strategies.calendar_diagonal import CalendarDiagonalEngine
+from trading_bot.strategies.base import candidate_quality_score
 from trading_bot.strategies.neutral_range import NeutralRangeEngine
 from trading_bot.strategies.scoring import StrategyScoreInput, score_strategy_setup
 from trading_bot.strategies.short_premium import ShortPremiumEngine
@@ -25,6 +26,7 @@ class StrategySelector:
         underlying: str,
         dte: int,
         score_inputs: Iterable[StrategyScoreInput],
+        risk_budget_base: float | None = None,
     ) -> list[StrategyCandidate]:
         candidates: list[StrategyCandidate] = []
         for score_input in score_inputs:
@@ -35,20 +37,66 @@ class StrategySelector:
                 underlying=underlying,
                 dte=dte,
                 score=score,
+                risk_budget_base=risk_budget_base,
             )
             if candidate is not None:
                 candidates.append(candidate)
-        return sorted(candidates, key=lambda candidate: candidate.entry_score, reverse=True)
+        return sorted(
+            candidates,
+            key=lambda candidate: (
+                candidate.entry_score,
+                candidate_quality_score(
+                    candidate,
+                    self.settings.risk.per_trade_max_loss_cap(
+                        risk_budget_base or self.settings.account.assumed_equity,
+                        candidate.entry_score,
+                    ),
+                ),
+            ),
+            reverse=True,
+        )
 
-    def _generate_candidate(self, strategy_name, contracts, underlying, dte, score):
+    def _generate_candidate(
+        self,
+        strategy_name,
+        contracts,
+        underlying,
+        dte,
+        score,
+        risk_budget_base: float | None = None,
+    ):
         if strategy_name == "put_credit_spread":
-            return self.short_premium.generate_put_credit_spread(contracts, underlying, dte, score)
+            return self.short_premium.generate_put_credit_spread(
+                contracts,
+                underlying,
+                dte,
+                score,
+                risk_budget_base=risk_budget_base,
+            )
         if strategy_name == "call_credit_spread":
-            return self.short_premium.generate_call_credit_spread(contracts, underlying, dte, score)
+            return self.short_premium.generate_call_credit_spread(
+                contracts,
+                underlying,
+                dte,
+                score,
+                risk_budget_base=risk_budget_base,
+            )
         if strategy_name == "call_debit_spread":
-            return self.trend.generate_call_debit_spread(contracts, underlying, dte, score)
+            return self.trend.generate_call_debit_spread(
+                contracts,
+                underlying,
+                dte,
+                score,
+                risk_budget_base=risk_budget_base,
+            )
         if strategy_name == "put_debit_spread":
-            return self.trend.generate_put_debit_spread(contracts, underlying, dte, score)
+            return self.trend.generate_put_debit_spread(
+                contracts,
+                underlying,
+                dte,
+                score,
+                risk_budget_base=risk_budget_base,
+            )
         if strategy_name == "iron_condor":
             return self.neutral_range.generate_iron_condor(contracts, underlying, dte, score)
         if strategy_name == "calendar_spread":

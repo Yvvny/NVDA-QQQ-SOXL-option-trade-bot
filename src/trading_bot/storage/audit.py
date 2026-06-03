@@ -2,10 +2,12 @@ from __future__ import annotations
 
 import json
 from dataclasses import asdict, is_dataclass
-from datetime import UTC, date, datetime
+from datetime import date, datetime
 from enum import Enum
 from pathlib import Path
 from typing import Any
+
+from trading_bot.core.time_utils import now_new_york
 
 
 class JsonlAuditLogger:
@@ -14,7 +16,7 @@ class JsonlAuditLogger:
 
     def record(self, event: dict[str, Any]) -> None:
         self.path.parent.mkdir(parents=True, exist_ok=True)
-        payload = {"logged_at": datetime.now(UTC), **event}
+        payload = {"logged_at": now_new_york(), **event}
         with self.path.open("a", encoding="utf-8") as handle:
             handle.write(json.dumps(_jsonable(payload), sort_keys=True) + "\n")
 

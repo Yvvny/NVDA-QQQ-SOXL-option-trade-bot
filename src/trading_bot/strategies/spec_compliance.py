@@ -2,6 +2,7 @@ from __future__ import annotations
 
 from dataclasses import dataclass, field
 
+from trading_bot.config.settings import BotSettings, load_settings
 from trading_bot.core.enums import OptionType
 from trading_bot.core.models import StrategyCandidate
 from trading_bot.regime.classifier import RegimeLabel
@@ -23,6 +24,10 @@ STRICT_ALLOWED_STRATEGIES_BY_REGIME: dict[RegimeLabel, frozenset[str]] = {
     RegimeLabel.CRASH_RISK_OFF: frozenset({"put_debit_spread"}),
 }
 
+PAPER_EXPERIMENTAL_ALLOWED_STRATEGIES_BY_REGIME: dict[RegimeLabel, frozenset[str]] = {
+    RegimeLabel.RANGE_LOW_IV: frozenset({"call_debit_spread"}),
+}
+
 
 @dataclass(frozen=True)
 class SpecComplianceDecision:
@@ -35,8 +40,11 @@ def validate_candidate_against_strategy_spec(
     candidate: StrategyCandidate,
     *,
     regime_label: RegimeLabel,
-    account_equity: float,
+    risk_budget_base: float,
+    experimental_mode: bool = False,
+    settings: BotSettings | None = None,
 ) -> SpecComplianceDecision:
+    settings = settings or load_settings()
     reasons: list[str] = []
     warnings: list[str] = []
     underlying = candidate.underlying.upper()
@@ -45,9 +53,22 @@ def validate_candidate_against_strategy_spec(
     if candidate.entry_score < STRICT_MIN_SCORE:
         reasons.append("spec_score_below_60")
 
-    allowed = STRICT_ALLOWED_STRATEGIES_BY_REGIME.get(regime_label, frozenset())
+    allowed = set(STRICT_ALLOWED_STRATEGIES_BY_REGIME.get(regime_label, frozenset()))
+    experimental_allowed = PAPER_EXPERIMENTAL_ALLOWED_STRATEGIES_BY_REGIME.get(
+        regime_label,
+        frozenset(),
+    )
+    used_experimental_override = False
+    if experimental_mode and strategy in experimental_allowed:
+        allowed.add(strategy)
+        used_experimental_override = strategy not in STRICT_ALLOWED_STRATEGIES_BY_REGIME.get(
+            regime_label,
+            frozenset(),
+        )
     if strategy not in allowed:
         reasons.append(f"spec_strategy_not_allowed_for_{regime_label.value}")
+    elif used_experimental_override:
+        warnings.append(f"spec_experimental_strategy_override_for_{regime_label.value}")
 
     if candidate.event_risk_blocked or "event_risk_penalty" in candidate.reason_codes:
         reasons.append("spec_major_event_risk_block")
@@ -64,9 +85,9 @@ def validate_candidate_against_strategy_spec(
     _validate_underlying_rules(candidate, reasons)
     _validate_dte_rules(candidate, regime_label, reasons, warnings)
     _validate_delta_rules(candidate, reasons)
-    _validate_liquidity_rules(candidate, reasons)
+    _validate_liquidity_rules(candidate, reasons, warnings)
     _validate_credit_or_debit_rules(candidate, reasons)
-    _validate_small_account_risk(candidate, underlying, account_equity, reasons)
+    _validate_small_account_risk(candidate, underlying, risk_budget_base, settings, reasons)
 
     return SpecComplianceDecision(
         approved=not reasons,
@@ -157,16 +178,31 @@ def _validate_delta_rules(candidate: StrategyCandidate, reasons: list[str]) -> N
             reasons.append("spec_trend_short_delta_out_of_range")
 
 
-def _validate_liquidity_rules(candidate: StrategyCandidate, reasons: list[str]) -> None:
+def _validate_liquidity_rules(
+    candidate: StrategyCandidate,
+    reasons: list[str],
+    warnings: list[str],
+) -> None:
     for leg in candidate.legs:
         spread_pct = bid_ask_pct_of_mid(leg.contract)
         if spread_pct is None:
             reasons.append("spec_missing_bid_ask_spread")
         elif spread_pct > STRICT_MAX_BID_ASK_PCT_OF_MID:
             reasons.append("spec_bid_ask_spread_above_12pct_mid")
-        if leg.contract.volume is None or leg.contract.volume < 10:
+        if leg.contract.volume is None:
+            if leg.contract.allow_missing_activity_data:
+                warnings.append("spec_missing_volume_metadata")
+            else:
+                reasons.append("spec_low_or_missing_volume")
+        elif leg.contract.volume < 10:
             reasons.append("spec_low_or_missing_volume")
-        if leg.contract.open_interest is None or leg.contract.open_interest < 100:
+
+        if leg.contract.open_interest is None:
+            if leg.contract.allow_missing_activity_data:
+                warnings.append("spec_missing_open_interest_metadata")
+            else:
+                reasons.append("spec_low_or_missing_open_interest")
+        elif leg.contract.open_interest < 100:
             reasons.append("spec_low_or_missing_open_interest")
 
 
@@ -195,17 +231,22 @@ def _validate_credit_or_debit_rules(
 def _validate_small_account_risk(
     candidate: StrategyCandidate,
     underlying: str,
-    account_equity: float,
+    risk_budget_base: float,
+    settings: BotSettings,
     reasons: list[str],
 ) -> None:
     if candidate.max_loss is None:
         reasons.append("spec_missing_max_loss")
         return
-    if candidate.max_loss > 200 and candidate.entry_score >= 80:
-        reasons.append("spec_high_score_trade_risk_above_200")
-    if candidate.max_loss > 150 and candidate.entry_score < 80:
-        reasons.append("spec_normal_trade_risk_above_150")
-    if underlying == "SOXL" and candidate.max_loss > account_equity * 0.10:
+    per_trade_limit = settings.risk.per_trade_max_loss_cap(
+        risk_budget_base,
+        candidate.entry_score,
+    )
+    if candidate.entry_score >= 80 and candidate.max_loss > per_trade_limit:
+        reasons.append("spec_high_score_trade_risk_above_40pct_equity")
+    if candidate.entry_score < 80 and candidate.max_loss > per_trade_limit:
+        reasons.append("spec_normal_trade_risk_above_20pct_equity")
+    if underlying == "SOXL" and candidate.max_loss > risk_budget_base * 0.10:
         reasons.append("spec_soxl_trade_risk_above_10pct")
 
 

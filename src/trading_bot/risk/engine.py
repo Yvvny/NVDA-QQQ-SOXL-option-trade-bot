@@ -101,10 +101,9 @@ class RiskEngine:
         portfolio_state: PortfolioState,
         reason_codes: list[str],
     ) -> None:
-        per_trade_limit = (
-            self.settings.risk.per_trade_max_loss_high_score
-            if candidate.entry_score >= 80
-            else self.settings.risk.per_trade_max_loss_default
+        per_trade_limit = self.settings.risk.per_trade_max_loss_cap(
+            risk_budget_base=portfolio_state.available_cash,
+            entry_score=candidate.entry_score,
         )
         if candidate.max_loss is not None and candidate.max_loss > per_trade_limit:
             reason_codes.append(REASON_PER_TRADE_MAX_LOSS_EXCEEDED)
@@ -117,7 +116,7 @@ class RiskEngine:
             reason_codes.append(REASON_SOXL_MAX_LOSS_EXCEEDED)
 
         max_total_open_loss = (
-            portfolio_state.account_equity * self.settings.risk.total_open_max_loss_pct
+            portfolio_state.available_cash * self.settings.risk.total_open_max_loss_pct
         )
         projected_open_loss = portfolio_state.total_open_max_loss + (candidate.max_loss or 0.0)
         if projected_open_loss > max_total_open_loss:

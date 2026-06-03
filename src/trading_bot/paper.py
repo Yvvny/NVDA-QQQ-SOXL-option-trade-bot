@@ -3,12 +3,13 @@ from __future__ import annotations
 import json
 import time
 from dataclasses import asdict, dataclass, field
-from datetime import UTC, datetime, timedelta
+from datetime import datetime, timedelta
 from pathlib import Path
 from typing import Any
 from uuid import uuid4
 
 from trading_bot.config.settings import BotSettings, load_settings
+from trading_bot.core.time_utils import iso_now_new_york, now_new_york, parse_timestamp, today_new_york
 from trading_bot.core.enums import OptionAction
 from trading_bot.core.models import OptionContract, StrategyCandidate
 from trading_bot.data.tastytrade_source import TastytradeSdkDataSource
@@ -74,8 +75,8 @@ class PaperAccountState:
     realized_pnl: float = 0.0
     open_positions: tuple[PaperPosition, ...] = field(default_factory=tuple)
     closed_trades: tuple[PaperClosedTrade, ...] = field(default_factory=tuple)
-    created_at: str = field(default_factory=lambda: datetime.now(UTC).isoformat())
-    updated_at: str = field(default_factory=lambda: datetime.now(UTC).isoformat())
+    created_at: str = field(default_factory=iso_now_new_york)
+    updated_at: str = field(default_factory=iso_now_new_york)
 
     @property
     def unrealized_pnl(self) -> float:
@@ -89,10 +90,15 @@ class PaperAccountState:
     def total_open_max_loss(self) -> float:
         return round(sum(position.max_loss for position in self.open_positions), 2)
 
+    @property
+    def available_cash(self) -> float:
+        return round(max(0.0, self.equity - self.total_open_max_loss), 2)
+
     def to_summary(self) -> dict[str, Any]:
         return {
             "starting_equity": self.starting_equity,
             "equity": self.equity,
+            "available_cash": self.available_cash,
             "realized_pnl": round(self.realized_pnl, 2),
             "unrealized_pnl": self.unrealized_pnl,
             "total_pnl": round(self.equity - self.starting_equity, 2),
@@ -141,6 +147,7 @@ class PaperTradingSimulator:
         max_contracts: int = 120,
         tastytrade_data_source: TastytradeSdkDataSource | None = None,
         strict_spec: bool = False,
+        paper_experimental: bool = False,
     ) -> None:
         if source not in {"mock", "tastytrade"}:
             raise ValueError("source must be 'mock' or 'tastytrade'.")
@@ -165,6 +172,7 @@ class PaperTradingSimulator:
         self.max_contracts = max_contracts
         self.tastytrade_data_source = tastytrade_data_source
         self.strict_spec = strict_spec
+        self.paper_experimental = paper_experimental
         self.selector = StrategySelector(self.settings)
         self.risk_engine = RiskEngine(self.settings)
         self.order_builder = OrderBuilder(self.settings)
@@ -180,8 +188,19 @@ class PaperTradingSimulator:
         for symbol in self.symbols:
             try:
                 snapshot = self._load_snapshot(symbol)
-                state, close_count = _mark_and_close_positions(state, snapshot.option_contracts)
+                state, close_count, closed_trades = _mark_and_close_positions(
+                    state,
+                    snapshot.option_contracts,
+                )
                 closed += close_count
+                for closed_trade in closed_trades:
+                    self._record(
+                        {
+                            "event_type": "paper_position_closed",
+                            "symbol": closed_trade.position.underlying,
+                            "paper_closed_trade": closed_trade,
+                        }
+                    )
 
                 regime_label = _regime_label_for_snapshot(snapshot)
                 score_inputs = _score_inputs_for_snapshot(
@@ -193,6 +212,7 @@ class PaperTradingSimulator:
                     underlying=snapshot.symbol,
                     dte=snapshot.dte,
                     score_inputs=score_inputs,
+                    risk_budget_base=state.available_cash,
                 )
                 generated += len(candidates)
                 self._record(
@@ -222,7 +242,9 @@ class PaperTradingSimulator:
                         spec_decision = validate_candidate_against_strategy_spec(
                             candidate,
                             regime_label=regime_label,
-                            account_equity=state.equity,
+                            risk_budget_base=state.available_cash,
+                            experimental_mode=self.paper_experimental,
+                            settings=self.settings,
                         )
                         if not spec_decision.approved:
                             rejected += 1
@@ -230,6 +252,7 @@ class PaperTradingSimulator:
                                 {
                                     "event_type": "paper_candidate_spec_rejected",
                                     "strict_spec": True,
+                                    "paper_experimental": self.paper_experimental,
                                     "symbol": symbol,
                                     "regime_label": regime_label.value,
                                     "candidate": candidate,
@@ -243,6 +266,7 @@ class PaperTradingSimulator:
                                 {
                                     "event_type": "paper_candidate_spec_warning",
                                     "strict_spec": True,
+                                    "paper_experimental": self.paper_experimental,
                                     "symbol": symbol,
                                     "regime_label": regime_label.value,
                                     "candidate": candidate,
@@ -280,7 +304,7 @@ class PaperTradingSimulator:
             except Exception as exc:  # noqa: BLE001 - unattended loop must keep moving.
                 errors.append(f"{symbol}: {exc.__class__.__name__}: {exc}")
 
-        state = _replace_state(state, updated_at=datetime.now(UTC).isoformat())
+        state = _replace_state(state, updated_at=iso_now_new_york())
         self.save_state(state)
         result = PaperCycleResult(
             cycle_index=cycle_index,
@@ -312,14 +336,14 @@ class PaperTradingSimulator:
         if days is not None and days <= 0:
             raise ValueError("days must be positive.")
 
-        deadline = datetime.now(UTC) + timedelta(days=days) if days is not None else None
+        deadline = now_new_york() + timedelta(days=days) if days is not None else None
         results: list[PaperCycleResult] = []
         cycle_index = 1
         while cycles == 0 or cycle_index <= cycles:
             results.append(self.run_once(cycle_index=cycle_index))
             if cycles != 0 and cycle_index >= cycles:
                 break
-            if deadline is not None and datetime.now(UTC) >= deadline:
+            if deadline is not None and now_new_york() >= deadline:
                 break
             cycle_index += 1
             time.sleep(interval_seconds)
@@ -366,7 +390,7 @@ def _paper_position_from_candidate(
     exit_plan = asdict(candidate.exit_plan) if candidate.exit_plan is not None else {}
     return PaperPosition(
         position_id=uuid4().hex,
-        opened_at=datetime.now(UTC).isoformat(),
+        opened_at=iso_now_new_york(),
         underlying=candidate.underlying,
         strategy_name=candidate.strategy_name,
         dte_at_entry=candidate.dte,
@@ -407,10 +431,11 @@ def _position_value_from_legs(legs: tuple[PaperLeg, ...]) -> float:
 def _mark_and_close_positions(
     state: PaperAccountState,
     contracts: tuple[OptionContract, ...],
-) -> tuple[PaperAccountState, int]:
+) -> tuple[PaperAccountState, int, tuple[PaperClosedTrade, ...]]:
     contract_map = {contract.symbol: contract for contract in contracts}
     open_positions: list[PaperPosition] = []
     closed_trades = list(state.closed_trades)
+    newly_closed_trades: list[PaperClosedTrade] = []
     realized_pnl = state.realized_pnl
     closed_count = 0
 
@@ -421,14 +446,14 @@ def _mark_and_close_positions(
             open_positions.append(marked)
             continue
         realized_pnl = round(realized_pnl + marked.unrealized_pnl, 2)
-        closed_trades.append(
-            PaperClosedTrade(
-                position=marked,
-                closed_at=datetime.now(UTC).isoformat(),
-                exit_reason=exit_reason,
-                realized_pnl=marked.unrealized_pnl,
-            )
+        closed_trade = PaperClosedTrade(
+            position=marked,
+            closed_at=iso_now_new_york(),
+            exit_reason=exit_reason,
+            realized_pnl=marked.unrealized_pnl,
         )
+        closed_trades.append(closed_trade)
+        newly_closed_trades.append(closed_trade)
         closed_count += 1
 
     return (
@@ -438,9 +463,10 @@ def _mark_and_close_positions(
             open_positions=tuple(open_positions),
             closed_trades=tuple(closed_trades),
             created_at=state.created_at,
-            updated_at=datetime.now(UTC).isoformat(),
+            updated_at=iso_now_new_york(),
         ),
         closed_count,
+        tuple(newly_closed_trades),
     )
 
 
@@ -467,7 +493,7 @@ def _mark_position(
         position,
         last_mark_value=round(current_value, 2),
         unrealized_pnl=pnl,
-        last_marked_at=datetime.now(UTC).isoformat(),
+        last_marked_at=iso_now_new_york(),
     )
 
 
@@ -498,24 +524,26 @@ def _exit_reason(position: PaperPosition) -> str | None:
 
 
 def _days_to_earliest_expiration(position: PaperPosition) -> int:
-    today = datetime.now(UTC).date()
+    today = today_new_york()
     expirations = [datetime.fromisoformat(leg.expiration).date() for leg in position.legs]
     return min((expiration - today).days for expiration in expirations)
 
 
 def _portfolio_state_from_paper(state: PaperAccountState) -> PortfolioState:
-    today = datetime.now(UTC).date()
+    today = today_new_york()
     week_start = today - timedelta(days=today.weekday())
     today_opens = 0
     week_opens = 0
     for position in state.open_positions:
-        opened_date = datetime.fromisoformat(position.opened_at).date()
+        opened_timestamp = parse_timestamp(position.opened_at)
+        opened_date = opened_timestamp.date() if opened_timestamp else datetime.fromisoformat(position.opened_at).date()
         if opened_date == today:
             today_opens += 1
         if opened_date >= week_start:
             week_opens += 1
     return PortfolioState(
         account_equity=state.equity,
+        risk_budget_base=state.available_cash,
         open_positions=tuple(
             OpenPosition(
                 symbol=position.underlying,
@@ -534,7 +562,8 @@ def _portfolio_state_from_paper(state: PaperAccountState) -> PortfolioState:
 def _realized_pnl_since(state: PaperAccountState, start_date) -> float:
     total = 0.0
     for trade in state.closed_trades:
-        closed_date = datetime.fromisoformat(trade.closed_at).date()
+        closed_timestamp = parse_timestamp(trade.closed_at)
+        closed_date = closed_timestamp.date() if closed_timestamp else datetime.fromisoformat(trade.closed_at).date()
         if closed_date >= start_date:
             total += trade.realized_pnl
     return round(total, 2)
@@ -550,7 +579,7 @@ def _add_open_position(
         open_positions=(*state.open_positions, position),
         closed_trades=state.closed_trades,
         created_at=state.created_at,
-        updated_at=datetime.now(UTC).isoformat(),
+        updated_at=iso_now_new_york(),
     )
 
 
@@ -582,8 +611,8 @@ def _state_from_dict(payload: dict[str, Any]) -> PaperAccountState:
             )
             for item in payload.get("closed_trades", [])
         ),
-        created_at=payload.get("created_at") or datetime.now(UTC).isoformat(),
-        updated_at=payload.get("updated_at") or datetime.now(UTC).isoformat(),
+        created_at=payload.get("created_at") or iso_now_new_york(),
+        updated_at=payload.get("updated_at") or iso_now_new_york(),
     )
 
 

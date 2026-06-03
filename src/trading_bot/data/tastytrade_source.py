@@ -10,6 +10,7 @@ from decimal import Decimal
 from pathlib import Path
 from typing import Any
 
+from trading_bot.core.time_utils import now_new_york
 from trading_bot.core.enums import OptionType
 from trading_bot.core.models import OptionContract, UnderlyingQuote
 
@@ -270,6 +271,7 @@ def contracts_from_sdk_options(
                 iv=iv,
                 volume=_optional_int(getattr(option, "volume", None)),
                 open_interest=_optional_int(getattr(option, "open_interest", None)),
+                allow_missing_activity_data=True,
             )
         )
     return contracts
@@ -430,8 +432,8 @@ def _timestamp_from_quote(quote: Any):
     raw_time = getattr(quote, "bid_time", None) or getattr(quote, "event_time", None)
     if isinstance(raw_time, int | float) and raw_time > 0:
         seconds = raw_time / 1000 if raw_time > 10_000_000_000 else raw_time
-        return datetime.fromtimestamp(seconds, tz=UTC)
-    return datetime.now(UTC)
+        return datetime.fromtimestamp(seconds, tz=UTC).astimezone(now_new_york().tzinfo)
+    return now_new_york()
 
 
 def _parse_bool(value: str) -> bool:

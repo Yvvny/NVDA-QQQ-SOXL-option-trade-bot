@@ -2,11 +2,12 @@ from __future__ import annotations
 
 import json
 from dataclasses import asdict, dataclass, is_dataclass
-from datetime import UTC, date, datetime
+from datetime import date, datetime
 from enum import Enum
 from pathlib import Path
 from typing import Any, Protocol
 
+from trading_bot.core.time_utils import now_new_york
 from trading_bot.research_bot.analyzer import ResearchInput
 from trading_bot.research_bot.prompts import build_research_review_prompt
 from trading_bot.research_bot.schemas import ResearchReviewReport
@@ -37,7 +38,7 @@ class ResearchReviewer:
 
     def review_to_artifact(self, research_input: ResearchInput) -> ResearchReviewArtifact:
         return ResearchReviewArtifact(
-            generated_at=datetime.now(UTC),
+            generated_at=now_new_york(),
             model=self.model,
             report=self.review(research_input),
             research_input=research_input,

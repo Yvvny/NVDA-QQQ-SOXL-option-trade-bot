@@ -11,7 +11,7 @@ from trading_bot.core.enums import OptionType
 from trading_bot.core.models import OptionContract, StrategyCandidate, UnderlyingQuote
 from trading_bot.data.tastytrade_source import TastytradeMarketDataDiagnostics
 from trading_bot.regime.classifier import RegimeLabel
-from trading_bot.strategies.base import contract_liquidity_warnings
+from trading_bot.strategies.base import blocking_liquidity_warnings, contract_liquidity_warnings
 from trading_bot.strategies.scoring import StrategyScoreInput, score_strategy_setup
 
 
@@ -258,7 +258,7 @@ def _eligible_contracts(
     contracts: Sequence[OptionContract],
 ) -> list[OptionContract]:
     return [
-        contract for contract in contracts if not contract_liquidity_warnings(contract, settings)
+        contract for contract in contracts if not blocking_liquidity_warnings(contract, settings)
     ]
 
 
