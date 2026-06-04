@@ -4,6 +4,7 @@ from collections.abc import Iterable, Sequence
 
 from trading_bot.config.settings import BotSettings, load_settings
 from trading_bot.core.models import OptionContract, StrategyCandidate
+from trading_bot.risk.portfolio import PortfolioState
 from trading_bot.strategies.calendar_diagonal import CalendarDiagonalEngine
 from trading_bot.strategies.base import candidate_quality_score
 from trading_bot.strategies.neutral_range import NeutralRangeEngine
@@ -27,6 +28,7 @@ class StrategySelector:
         dte: int,
         score_inputs: Iterable[StrategyScoreInput],
         risk_budget_base: float | None = None,
+        portfolio_state: PortfolioState | None = None,
     ) -> list[StrategyCandidate]:
         candidates: list[StrategyCandidate] = []
         for score_input in score_inputs:
@@ -51,6 +53,7 @@ class StrategySelector:
                         risk_budget_base or self.settings.account.assumed_equity,
                         candidate.entry_score,
                     ),
+                    portfolio_state,
                 ),
             ),
             reverse=True,

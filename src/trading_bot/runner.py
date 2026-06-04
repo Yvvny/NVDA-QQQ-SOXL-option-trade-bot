@@ -74,12 +74,14 @@ class DryRunBotRunner:
         regime_label = _regime_label_for_snapshot(snapshot)
         contracts = snapshot.option_contracts
         score_inputs = _score_inputs_for_snapshot(regime_label, contracts)
+        portfolio_state = PortfolioState(account_equity=self.settings.account.assumed_equity)
         candidates = self.selector.generate_candidates(
             contracts=contracts,
             underlying=snapshot.symbol,
             dte=snapshot.dte,
             score_inputs=score_inputs,
             risk_budget_base=self.settings.account.assumed_equity,
+            portfolio_state=portfolio_state,
         )
         self.executor.audit_logger.record(
             {
@@ -100,25 +102,25 @@ class DryRunBotRunner:
                 ),
             }
         )
-        portfolio_state = PortfolioState(account_equity=self.settings.account.assumed_equity)
         results: list[DryRunExecutionResult] = []
 
         for candidate in candidates[: self.max_candidates_per_cycle]:
             result = self.executor.execute(candidate, portfolio_state)
             results.append(result)
-            if result.risk_decision.approved and candidate.max_loss is not None:
+            if result.risk_decision.approved and result.risk_decision.max_loss is not None:
                 portfolio_state = PortfolioState(
                     account_equity=portfolio_state.account_equity,
                     risk_budget_base=max(
                         0.0,
-                        portfolio_state.available_cash - (candidate.max_loss or 0.0),
+                        portfolio_state.available_cash
+                        - (result.risk_decision.max_loss or 0.0),
                     ),
                     open_positions=(
                         *portfolio_state.open_positions,
                         OpenPosition(
                             symbol=candidate.underlying,
                             strategy_name=candidate.strategy_name,
-                            max_loss=candidate.max_loss,
+                            max_loss=result.risk_decision.max_loss,
                         ),
                     ),
                     daily_realized_pnl=portfolio_state.daily_realized_pnl,

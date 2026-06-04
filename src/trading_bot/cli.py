@@ -7,8 +7,12 @@ from dataclasses import asdict
 from datetime import date
 
 from trading_bot.api import UiServerConfig, run_ui_server
+from trading_bot.backtest import load_scenarios_from_json, run_exit_matrix
 from trading_bot.broker import fetch_tastytrade_account_snapshot
 from trading_bot.config.settings import load_settings
+from trading_bot.data.qqq_chain_archive import DEFAULT_QQQ_SPOOL_ROOT, QqqFullChainCollector
+from trading_bot.data.tastytrade_source import TastytradeSdkDataSource
+from trading_bot.core.time_utils import now_new_york
 from trading_bot.paper import DEFAULT_PAPER_STATE_PATH, PaperTradingSimulator
 from trading_bot.research_bot import (
     ChatGPTResearchExportWriter,
@@ -126,6 +130,43 @@ def build_parser() -> argparse.ArgumentParser:
         default="docs/reports/trade_audit.jsonl",
         help="JSONL audit log path for UI runs.",
     )
+
+    exit_matrix = subparsers.add_parser(
+        "exit-matrix",
+        help="Run the documented exit-parameter experiment matrix on backtest scenarios.",
+    )
+    exit_matrix.add_argument(
+        "--scenario-file",
+        required=True,
+        help="JSON file containing a list of backtest scenarios or {\"scenarios\": [...]}",
+    )
+    exit_matrix.add_argument(
+        "--output-dir",
+        default="docs/reports/backtests/exit_matrix",
+        help="Directory where the matrix summary and per-variant reports will be written.",
+    )
+    exit_matrix.add_argument(
+        "--initial-equity",
+        type=float,
+        default=2000.0,
+        help="Initial account equity for the backtest runs.",
+    )
+
+    collect_qqq_chain = subparsers.add_parser(
+        "collect-qqq-chain",
+        help="Collect one full QQQ option-chain snapshot into the cloud spool archive.",
+    )
+    collect_qqq_chain.add_argument(
+        "--spool-root",
+        default=str(DEFAULT_QQQ_SPOOL_ROOT),
+        help="Root directory for raw chain snapshots, diagnostics, and manifests.",
+    )
+    collect_qqq_chain.add_argument(
+        "--max-contracts-per-batch",
+        type=int,
+        default=500,
+        help="Maximum option contracts to subscribe to per market-data batch.",
+    )
     return parser
 
 
@@ -239,6 +280,46 @@ def main(argv: Sequence[str] | None = None) -> int:
         )
         output_path = ChatGPTResearchExportWriter(args.output_dir).write(research_input)
         print(json.dumps({"export_path": str(output_path)}, indent=2, sort_keys=True))
+        return 0
+
+    if args.command == "exit-matrix":
+        scenarios = load_scenarios_from_json(args.scenario_file)
+        report = run_exit_matrix(scenarios, initial_equity=args.initial_equity)
+        summary_path = report.write_reports(args.output_dir)
+        print(
+            json.dumps(
+                {
+                    "summary_path": str(summary_path),
+                    "report": report.to_dict(),
+                },
+                indent=2,
+                sort_keys=True,
+            )
+        )
+        return 0
+
+    if args.command == "collect-qqq-chain":
+        now = now_new_york()
+        if now.weekday() >= 5 or (now.hour, now.minute) < (9, 30) or (now.hour, now.minute) > (16, 0):
+            print(
+                json.dumps(
+                    {
+                        "collected": False,
+                        "reason": "outside_regular_market_hours",
+                        "checked_at": now.isoformat(),
+                        "symbol": "QQQ",
+                    },
+                    indent=2,
+                    sort_keys=True,
+                )
+            )
+            return 0
+        collector = QqqFullChainCollector(
+            source=TastytradeSdkDataSource.from_env(max_contracts=args.max_contracts_per_batch),
+            spool_root=args.spool_root,
+        )
+        result = collector.collect_once("QQQ")
+        print(json.dumps(result.to_dict(), indent=2, sort_keys=True))
         return 0
 
     parser.error(f"unknown command: {args.command}")

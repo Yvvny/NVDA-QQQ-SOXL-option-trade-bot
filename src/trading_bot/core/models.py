@@ -128,6 +128,22 @@ class StrategyCandidate:
         if self.quantity <= 0:
             raise ValueError("Candidate quantity must be positive.")
 
+    def total_max_loss(self) -> float | None:
+        if self.max_loss is None:
+            return None
+        return round(self.max_loss * self.quantity, 2)
+
+    def total_max_profit(self) -> float | None:
+        if self.max_profit is None:
+            return None
+        return round(self.max_profit * self.quantity, 2)
+
+    def total_expected_credit_or_debit(self) -> float:
+        return round(self.expected_credit_or_debit * self.quantity, 2)
+
+    def effective_leg_quantity(self, leg: OptionLeg) -> int:
+        return leg.quantity * self.quantity
+
 
 @dataclass(frozen=True)
 class RiskDecision:

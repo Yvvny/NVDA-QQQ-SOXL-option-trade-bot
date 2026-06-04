@@ -94,6 +94,13 @@ def test_rejects_trade_when_available_cash_budget_is_smaller_than_equity_budget(
     assert REASON_PER_TRADE_MAX_LOSS_EXCEEDED in decision.reason_codes
 
 
+def test_rejects_trade_when_total_quantity_risk_exceeds_limit():
+    decision = RiskEngine().evaluate(_candidate(quantity=5), _portfolio())
+
+    assert decision.approved is False
+    assert REASON_PER_TRADE_MAX_LOSS_EXCEEDED in decision.reason_codes
+
+
 def test_high_score_can_use_high_score_per_trade_limit():
     decision = RiskEngine().evaluate(_candidate(max_loss=450, entry_score=85), _portfolio())
 

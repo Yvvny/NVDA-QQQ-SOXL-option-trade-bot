@@ -35,7 +35,9 @@ class OrderBuilder:
         self.settings = settings or load_settings()
 
     def build(self, candidate: StrategyCandidate) -> OptionOrder:
-        if candidate.max_loss is None:
+        total_max_loss = candidate.total_max_loss()
+        total_max_profit = candidate.total_max_profit()
+        if total_max_loss is None:
             raise ValueError("Cannot build order without max_loss.")
         if candidate.order_type != OrderType.LIMIT:
             raise ValueError("Only limit option orders are supported.")
@@ -58,9 +60,9 @@ class OrderBuilder:
             order_type=OrderType.LIMIT,
             price_effect=price_effect,
             limit_price=round(limit_price, 2),
-            legs=tuple(_build_order_leg(leg) for leg in candidate.legs),
-            max_profit=candidate.max_profit,
-            max_loss=candidate.max_loss,
+            legs=tuple(_build_order_leg(candidate, leg) for leg in candidate.legs),
+            max_profit=total_max_profit,
+            max_loss=total_max_loss,
             entry_score=candidate.entry_score,
         )
 
@@ -71,12 +73,12 @@ def _price_effect(strategy_name: str) -> str:
     return "debit"
 
 
-def _build_order_leg(leg: OptionLeg) -> OrderLeg:
+def _build_order_leg(candidate: StrategyCandidate, leg: OptionLeg) -> OrderLeg:
     contract = leg.contract
     return OrderLeg(
         symbol=contract.symbol,
         action=leg.action,
-        quantity=leg.quantity,
+        quantity=candidate.effective_leg_quantity(leg),
         option_type=contract.option_type,
         strike=contract.strike,
         expiration=contract.expiration.isoformat(),

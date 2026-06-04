@@ -8,12 +8,24 @@ from trading_bot.backtest.engine import (
     BacktestSkippedTrade,
     OptionPositionSnapshot,
 )
+from trading_bot.backtest.exit_matrix import (
+    DEFAULT_EXIT_VARIANTS,
+    ExitMatrixReport,
+    ExitMatrixVariantReport,
+    ExitVariantSpec,
+    load_scenarios_from_json,
+    run_exit_matrix,
+)
 from trading_bot.backtest.fills import FillAssumption, estimate_fill_price
 from trading_bot.backtest.metrics import BacktestMetrics, BacktestTrade, calculate_metrics
 from trading_bot.backtest.slippage import apply_slippage
 
 __all__ = [
     "BacktestEngine",
+    "DEFAULT_EXIT_VARIANTS",
+    "ExitMatrixReport",
+    "ExitMatrixVariantReport",
+    "ExitVariantSpec",
     "BacktestMetrics",
     "BacktestResult",
     "BacktestScenario",
@@ -25,4 +37,6 @@ __all__ = [
     "apply_slippage",
     "calculate_metrics",
     "estimate_fill_price",
+    "load_scenarios_from_json",
+    "run_exit_matrix",
 ]

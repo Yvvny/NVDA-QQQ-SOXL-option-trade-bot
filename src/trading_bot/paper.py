@@ -16,6 +16,7 @@ from trading_bot.data.tastytrade_source import TastytradeSdkDataSource
 from trading_bot.execution.order_builder import OrderBuilder
 from trading_bot.risk.engine import RiskEngine
 from trading_bot.risk.portfolio import OpenPosition, PortfolioState
+from trading_bot.risk.sizing import PositionSizer
 from trading_bot.runner import (
     DryRunBotRunner,
     _regime_label_for_snapshot,
@@ -28,6 +29,19 @@ from trading_bot.strategies.spec_compliance import validate_candidate_against_st
 
 DEFAULT_PAPER_STATE_PATH = Path("docs/reports/paper_account.json")
 DEFAULT_PAPER_AUDIT_PATH = Path("docs/reports/paper_audit.jsonl")
+DEFAULT_PAPER_POSITION_PATHS_PATH = Path("docs/reports/paper_position_paths.jsonl")
+DEFAULT_PAPER_EXIT_MATRIX_SCENARIOS_PATH = Path(
+    "docs/reports/backtests/paper_exit_matrix_scenarios.json"
+)
+
+
+@dataclass(frozen=True)
+class PaperMarkSnapshot:
+    date: str
+    dte: int
+    mark_price: float
+    underlying_price: float | None = None
+    reason_code: str | None = None
 
 
 @dataclass(frozen=True)
@@ -56,6 +70,8 @@ class PaperPosition:
     entry_value: float
     legs: tuple[PaperLeg, ...]
     exit_plan: dict[str, Any]
+    candidate_payload: dict[str, Any] = field(default_factory=dict)
+    path_snapshots: tuple[PaperMarkSnapshot, ...] = field(default_factory=tuple)
     last_mark_value: float | None = None
     unrealized_pnl: float = 0.0
     last_marked_at: str | None = None
@@ -148,6 +164,8 @@ class PaperTradingSimulator:
         tastytrade_data_source: TastytradeSdkDataSource | None = None,
         strict_spec: bool = False,
         paper_experimental: bool = False,
+        position_paths_path: str | Path = DEFAULT_PAPER_POSITION_PATHS_PATH,
+        exit_matrix_scenarios_path: str | Path = DEFAULT_PAPER_EXIT_MATRIX_SCENARIOS_PATH,
     ) -> None:
         if source not in {"mock", "tastytrade"}:
             raise ValueError("source must be 'mock' or 'tastytrade'.")
@@ -167,14 +185,17 @@ class PaperTradingSimulator:
         self.max_candidates_per_symbol = max_candidates_per_symbol
         self.state_path = Path(state_path)
         self.audit_logger = JsonlAuditLogger(audit_log_path)
+        self.position_path_logger = JsonlAuditLogger(position_paths_path)
         self.starting_equity = starting_equity
         self.quote_timeout_seconds = quote_timeout_seconds
         self.max_contracts = max_contracts
         self.tastytrade_data_source = tastytrade_data_source
         self.strict_spec = strict_spec
         self.paper_experimental = paper_experimental
+        self.exit_matrix_scenarios_path = Path(exit_matrix_scenarios_path)
         self.selector = StrategySelector(self.settings)
         self.risk_engine = RiskEngine(self.settings)
+        self.position_sizer = PositionSizer(self.settings)
         self.order_builder = OrderBuilder(self.settings)
 
     def run_once(self, cycle_index: int = 1) -> PaperCycleResult:
@@ -188,10 +209,25 @@ class PaperTradingSimulator:
         for symbol in self.symbols:
             try:
                 snapshot = self._load_snapshot(symbol)
-                state, close_count, closed_trades = _mark_and_close_positions(
+                underlying_last = (
+                    snapshot.underlying_quote.last if snapshot.underlying_quote is not None else None
+                )
+                state, close_count, closed_trades, marked_positions = _mark_and_close_positions(
                     state,
                     snapshot.option_contracts,
+                    underlying_price=underlying_last,
                 )
+                for marked_position in marked_positions:
+                    exit_reason = None
+                    for closed_trade in closed_trades:
+                        if closed_trade.position.position_id == marked_position.position_id:
+                            exit_reason = closed_trade.exit_reason
+                            break
+                    self._record_position_path(
+                        marked_position,
+                        underlying_price=underlying_last,
+                        reason_code=exit_reason,
+                    )
                 closed += close_count
                 for closed_trade in closed_trades:
                     self._record(
@@ -201,18 +237,21 @@ class PaperTradingSimulator:
                             "paper_closed_trade": closed_trade,
                         }
                     )
+                    self._persist_exit_matrix_scenario(closed_trade)
 
                 regime_label = _regime_label_for_snapshot(snapshot)
                 score_inputs = _score_inputs_for_snapshot(
                     regime_label,
                     snapshot.option_contracts,
                 )
+                portfolio_state = _portfolio_state_from_paper(state)
                 candidates = self.selector.generate_candidates(
                     contracts=snapshot.option_contracts,
                     underlying=snapshot.symbol,
                     dte=snapshot.dte,
                     score_inputs=score_inputs,
                     risk_budget_base=state.available_cash,
+                    portfolio_state=portfolio_state,
                 )
                 generated += len(candidates)
                 self._record(
@@ -235,9 +274,8 @@ class PaperTradingSimulator:
                         ),
                     }
                 )
-                portfolio_state = _portfolio_state_from_paper(state)
-
                 for candidate in candidates[: self.max_candidates_per_symbol]:
+                    candidate = self.position_sizer.size_candidate(candidate, portfolio_state)
                     if self.strict_spec:
                         spec_decision = validate_candidate_against_strategy_spec(
                             candidate,
@@ -379,14 +417,62 @@ class PaperTradingSimulator:
     def _record(self, event: dict[str, Any]) -> None:
         self.audit_logger.record(event)
 
+    def _record_position_path(
+        self,
+        position: PaperPosition,
+        *,
+        underlying_price: float | None = None,
+        reason_code: str | None = None,
+    ) -> None:
+        if position.last_mark_value is None:
+            return
+        snapshot = position.path_snapshots[-1] if position.path_snapshots else None
+        if snapshot is None:
+            return
+        self.position_path_logger.record(
+            {
+                "event_type": "paper_position_path_snapshot",
+                "position_id": position.position_id,
+                "symbol": position.underlying,
+                "strategy_name": position.strategy_name,
+                "snapshot": snapshot,
+                "underlying_price": underlying_price,
+                "reason_code": reason_code,
+            }
+        )
+
+    def _persist_exit_matrix_scenario(self, closed_trade: PaperClosedTrade) -> None:
+        scenario = _exit_matrix_scenario_from_closed_trade(closed_trade)
+        self.exit_matrix_scenarios_path.parent.mkdir(parents=True, exist_ok=True)
+        existing: dict[str, Any]
+        if self.exit_matrix_scenarios_path.exists():
+            existing = json.loads(self.exit_matrix_scenarios_path.read_text(encoding="utf-8"))
+            if not isinstance(existing, dict):
+                existing = {"scenarios": []}
+        else:
+            existing = {"scenarios": []}
+        scenarios = existing.get("scenarios", [])
+        scenarios = [
+            item for item in scenarios if str(item.get("trade_id")) != closed_trade.position.position_id
+        ]
+        scenarios.append(scenario)
+        existing["scenarios"] = scenarios
+        self.exit_matrix_scenarios_path.write_text(
+            json.dumps(existing, indent=2, sort_keys=True),
+            encoding="utf-8",
+        )
+
 
 def _paper_position_from_candidate(
     candidate: StrategyCandidate,
     price_effect: str,
 ) -> PaperPosition:
-    if candidate.max_loss is None:
+    total_max_loss = candidate.total_max_loss()
+    total_max_profit = candidate.total_max_profit()
+    total_expected_credit_or_debit = candidate.total_expected_credit_or_debit()
+    if total_max_loss is None:
         raise ValueError("Cannot paper trade a candidate without max_loss.")
-    legs = tuple(_paper_leg_from_option_leg(leg) for leg in candidate.legs)
+    legs = tuple(_paper_leg_from_option_leg(candidate, leg) for leg in candidate.legs)
     exit_plan = asdict(candidate.exit_plan) if candidate.exit_plan is not None else {}
     return PaperPosition(
         position_id=uuid4().hex,
@@ -395,24 +481,25 @@ def _paper_position_from_candidate(
         strategy_name=candidate.strategy_name,
         dte_at_entry=candidate.dte,
         entry_score=candidate.entry_score,
-        max_profit=candidate.max_profit,
-        max_loss=candidate.max_loss,
-        expected_credit_or_debit=candidate.expected_credit_or_debit,
+        max_profit=total_max_profit,
+        max_loss=total_max_loss,
+        expected_credit_or_debit=total_expected_credit_or_debit,
         price_effect=price_effect,
         entry_value=_position_value_from_legs(legs),
         legs=legs,
         exit_plan=exit_plan,
+        candidate_payload=_candidate_payload(candidate),
     )
 
 
-def _paper_leg_from_option_leg(leg) -> PaperLeg:
+def _paper_leg_from_option_leg(candidate: StrategyCandidate, leg) -> PaperLeg:
     mid = leg.contract.effective_mid()
     if mid is None:
         raise ValueError(f"Cannot paper trade leg without mid price: {leg.contract.symbol}")
     return PaperLeg(
         symbol=leg.contract.symbol,
         action=leg.action.value,
-        quantity=leg.quantity,
+        quantity=candidate.effective_leg_quantity(leg),
         option_type=leg.contract.option_type.value,
         strike=leg.contract.strike,
         expiration=leg.contract.expiration.isoformat(),
@@ -431,16 +518,19 @@ def _position_value_from_legs(legs: tuple[PaperLeg, ...]) -> float:
 def _mark_and_close_positions(
     state: PaperAccountState,
     contracts: tuple[OptionContract, ...],
-) -> tuple[PaperAccountState, int, tuple[PaperClosedTrade, ...]]:
+    underlying_price: float | None = None,
+) -> tuple[PaperAccountState, int, tuple[PaperClosedTrade, ...], tuple[PaperPosition, ...]]:
     contract_map = {contract.symbol: contract for contract in contracts}
     open_positions: list[PaperPosition] = []
     closed_trades = list(state.closed_trades)
     newly_closed_trades: list[PaperClosedTrade] = []
+    marked_positions: list[PaperPosition] = []
     realized_pnl = state.realized_pnl
     closed_count = 0
 
     for position in state.open_positions:
-        marked = _mark_position(position, contract_map)
+        marked = _mark_position(position, contract_map, underlying_price=underlying_price)
+        marked_positions.append(marked)
         exit_reason = _exit_reason(marked)
         if exit_reason is None:
             open_positions.append(marked)
@@ -467,12 +557,15 @@ def _mark_and_close_positions(
         ),
         closed_count,
         tuple(newly_closed_trades),
+        tuple(marked_positions),
     )
 
 
 def _mark_position(
     position: PaperPosition,
     contract_map: dict[str, OptionContract],
+    *,
+    underlying_price: float | None = None,
 ) -> PaperPosition:
     current_value = 0.0
     all_marked = True
@@ -489,8 +582,17 @@ def _mark_position(
     if not all_marked:
         pnl = position.unrealized_pnl
         current_value = position.last_mark_value or position.entry_value
+    candidate_quantity = int(position.candidate_payload.get("quantity", 1) or 1)
+    snapshot = PaperMarkSnapshot(
+        date=today_new_york().isoformat(),
+        dte=_days_to_earliest_expiration(position),
+        mark_price=round(abs(current_value) / (100 * candidate_quantity), 4),
+        underlying_price=underlying_price,
+    )
+    path_snapshots = _append_mark_snapshot(position.path_snapshots, snapshot)
     return _replace_position(
         position,
+        path_snapshots=path_snapshots,
         last_mark_value=round(current_value, 2),
         unrealized_pnl=pnl,
         last_marked_at=iso_now_new_york(),
@@ -527,6 +629,17 @@ def _days_to_earliest_expiration(position: PaperPosition) -> int:
     today = today_new_york()
     expirations = [datetime.fromisoformat(leg.expiration).date() for leg in position.legs]
     return min((expiration - today).days for expiration in expirations)
+
+
+def _append_mark_snapshot(
+    snapshots: tuple[PaperMarkSnapshot, ...],
+    snapshot: PaperMarkSnapshot,
+) -> tuple[PaperMarkSnapshot, ...]:
+    if snapshots:
+        last = snapshots[-1]
+        if last.date == snapshot.date and last.dte == snapshot.dte and last.mark_price == snapshot.mark_price:
+            return snapshots
+    return (*snapshots, snapshot)
 
 
 def _portfolio_state_from_paper(state: PaperAccountState) -> PortfolioState:
@@ -631,7 +744,82 @@ def _position_from_dict(payload: dict[str, Any]) -> PaperPosition:
         entry_value=float(payload["entry_value"]),
         legs=tuple(PaperLeg(**item) for item in payload.get("legs", [])),
         exit_plan=dict(payload.get("exit_plan", {})),
+        candidate_payload=dict(payload.get("candidate_payload", {})),
+        path_snapshots=tuple(
+            item if isinstance(item, PaperMarkSnapshot) else PaperMarkSnapshot(**item)
+            for item in payload.get("path_snapshots", [])
+        ),
         last_mark_value=payload.get("last_mark_value"),
         unrealized_pnl=float(payload.get("unrealized_pnl", 0.0)),
         last_marked_at=payload.get("last_marked_at"),
     )
+
+
+def _candidate_payload(candidate: StrategyCandidate) -> dict[str, Any]:
+    return {
+        "strategy_name": candidate.strategy_name,
+        "underlying": candidate.underlying,
+        "legs": [
+            {
+                "action": leg.action.value,
+                "quantity": leg.quantity,
+                "contract": {
+                    "symbol": leg.contract.symbol,
+                    "underlying": leg.contract.underlying,
+                    "expiration": leg.contract.expiration.isoformat(),
+                    "strike": leg.contract.strike,
+                    "option_type": leg.contract.option_type.value,
+                    "bid": leg.contract.bid,
+                    "ask": leg.contract.ask,
+                    "mid": leg.contract.mid,
+                    "delta": leg.contract.delta,
+                    "gamma": leg.contract.gamma,
+                    "theta": leg.contract.theta,
+                    "vega": leg.contract.vega,
+                    "iv": leg.contract.iv,
+                    "volume": leg.contract.volume,
+                    "open_interest": leg.contract.open_interest,
+                    "allow_missing_activity_data": leg.contract.allow_missing_activity_data,
+                },
+            }
+            for leg in candidate.legs
+        ],
+        "dte": candidate.dte,
+        "entry_score": candidate.entry_score,
+        "max_profit": candidate.max_profit,
+        "max_loss": candidate.max_loss,
+        "expected_credit_or_debit": candidate.expected_credit_or_debit,
+        "reason_codes": list(candidate.reason_codes),
+        "exit_plan": asdict(candidate.exit_plan) if candidate.exit_plan is not None else None,
+        "order_type": candidate.order_type.value,
+        "quantity": candidate.quantity,
+        "score_breakdown": asdict(candidate.score_breakdown) if candidate.score_breakdown else None,
+        "event_risk_blocked": candidate.event_risk_blocked,
+        "liquidity_ok": candidate.liquidity_ok,
+        "liquidity_warnings": list(candidate.liquidity_warnings),
+    }
+
+
+def _exit_matrix_scenario_from_closed_trade(closed_trade: PaperClosedTrade) -> dict[str, Any]:
+    position = closed_trade.position
+    snapshots = []
+    total = len(position.path_snapshots)
+    for index, snapshot in enumerate(position.path_snapshots):
+        reason_code = closed_trade.exit_reason if index == total - 1 else None
+        snapshots.append(
+            {
+                "date": snapshot.date,
+                "dte": snapshot.dte,
+                "mark_price": snapshot.mark_price,
+                "underlying_price": snapshot.underlying_price,
+                "reason_code": reason_code,
+            }
+        )
+    return {
+        "trade_id": position.position_id,
+        "entry_date": parse_timestamp(position.opened_at).date().isoformat()
+        if parse_timestamp(position.opened_at)
+        else position.opened_at[:10],
+        "candidate": position.candidate_payload,
+        "exit_snapshots": snapshots,
+    }

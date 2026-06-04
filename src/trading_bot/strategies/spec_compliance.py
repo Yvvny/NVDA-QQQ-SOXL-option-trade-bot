@@ -84,9 +84,9 @@ def validate_candidate_against_strategy_spec(
 
     _validate_underlying_rules(candidate, reasons)
     _validate_dte_rules(candidate, regime_label, reasons, warnings)
-    _validate_delta_rules(candidate, reasons)
+    _validate_delta_rules(candidate, settings, reasons)
     _validate_liquidity_rules(candidate, reasons, warnings)
-    _validate_credit_or_debit_rules(candidate, reasons)
+    _validate_credit_or_debit_rules(candidate, settings, reasons)
     _validate_small_account_risk(candidate, underlying, risk_budget_base, settings, reasons)
 
     return SpecComplianceDecision(
@@ -146,7 +146,11 @@ def _validate_dte_rules(
         reasons.append("spec_calendar_front_dte_out_of_range")
 
 
-def _validate_delta_rules(candidate: StrategyCandidate, reasons: list[str]) -> None:
+def _validate_delta_rules(
+    candidate: StrategyCandidate,
+    settings: BotSettings,
+    reasons: list[str],
+) -> None:
     strategy = candidate.strategy_name
     legs = candidate.legs
 
@@ -156,11 +160,21 @@ def _validate_delta_rules(candidate: StrategyCandidate, reasons: list[str]) -> N
 
     if strategy == "put_credit_spread":
         short_put = _short_leg_delta(candidate, OptionType.PUT)
-        if short_put is None or not 0.10 <= abs(short_put) <= 0.35:
+        if (
+            short_put is None
+            or not settings.delta.short_premium_min_abs
+            <= abs(short_put)
+            <= settings.delta.short_premium_max_abs
+        ):
             reasons.append("spec_put_credit_short_delta_out_of_range")
     elif strategy == "call_credit_spread":
         short_call = _short_leg_delta(candidate, OptionType.CALL)
-        if short_call is None or not 0.15 <= abs(short_call) <= 0.30:
+        if (
+            short_call is None
+            or not settings.delta.short_premium_min_abs
+            <= abs(short_call)
+            <= settings.delta.short_premium_max_abs
+        ):
             reasons.append("spec_call_credit_short_delta_out_of_range")
     elif strategy == "iron_condor":
         short_put = _short_leg_delta(candidate, OptionType.PUT)
@@ -208,13 +222,18 @@ def _validate_liquidity_rules(
 
 def _validate_credit_or_debit_rules(
     candidate: StrategyCandidate,
+    settings: BotSettings,
     reasons: list[str],
 ) -> None:
     strategy = candidate.strategy_name
     if strategy in {"put_credit_spread", "call_credit_spread"}:
         width = _spread_width(candidate)
         credit = candidate.expected_credit_or_debit / 100
-        if width is None or not 0.15 <= credit / width <= 0.35:
+        if width is None or not (
+            settings.strategy.credit_spread_min_pct_of_width
+            <= credit / width
+            <= settings.strategy.credit_spread_max_pct_of_width
+        ):
             reasons.append("spec_credit_spread_credit_target_out_of_range")
     elif strategy == "iron_condor":
         width = _spread_width(candidate)
@@ -235,18 +254,19 @@ def _validate_small_account_risk(
     settings: BotSettings,
     reasons: list[str],
 ) -> None:
-    if candidate.max_loss is None:
+    total_max_loss = candidate.total_max_loss()
+    if total_max_loss is None:
         reasons.append("spec_missing_max_loss")
         return
     per_trade_limit = settings.risk.per_trade_max_loss_cap(
         risk_budget_base,
         candidate.entry_score,
     )
-    if candidate.entry_score >= 80 and candidate.max_loss > per_trade_limit:
+    if candidate.entry_score >= 80 and total_max_loss > per_trade_limit:
         reasons.append("spec_high_score_trade_risk_above_40pct_equity")
-    if candidate.entry_score < 80 and candidate.max_loss > per_trade_limit:
+    if candidate.entry_score < 80 and total_max_loss > per_trade_limit:
         reasons.append("spec_normal_trade_risk_above_20pct_equity")
-    if underlying == "SOXL" and candidate.max_loss > risk_budget_base * 0.10:
+    if underlying == "SOXL" and total_max_loss > risk_budget_base * 0.10:
         reasons.append("spec_soxl_trade_risk_above_10pct")
 
 

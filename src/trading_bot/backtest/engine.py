@@ -135,9 +135,8 @@ class BacktestEngine:
             )
             fees = round(
                 self.simulation_config.commission_per_contract
-                * len(order.legs)
-                * 2
-                * quantity,
+                * sum(leg.quantity for leg in order.legs)
+                * 2,
                 2,
             )
             pnl = round(gross_pnl - fees, 2)
@@ -149,7 +148,7 @@ class BacktestEngine:
                     entry_date=scenario.entry_date,
                     exit_date=exit_snapshot.date,
                     pnl=pnl,
-                    max_loss=scenario.candidate.max_loss or 0.0,
+                    max_loss=scenario.candidate.total_max_loss() or 0.0,
                     exit_reason=exit_reason,
                     entry_price=entry_price,
                     exit_price=exit_price,
@@ -175,17 +174,21 @@ def _select_exit_snapshot(
     credit_strategies = {"put_credit_spread", "call_credit_spread", "iron_condor"}
     price_effect = "credit" if candidate.strategy_name in credit_strategies else "debit"
     entry_value = candidate.expected_credit_or_debit / CONTRACT_MULTIPLIER
+    total_max_profit = candidate.total_max_profit()
+    total_quantity = candidate.quantity
 
     for snapshot in ordered:
         if snapshot.reason_code:
             return snapshot, snapshot.reason_code
         if exit_plan is not None:
             if price_effect == "credit":
-                open_profit = (entry_value - snapshot.mark_price) * CONTRACT_MULTIPLIER
+                open_profit = (
+                    entry_value - snapshot.mark_price
+                ) * CONTRACT_MULTIPLIER * total_quantity
                 if (
                     exit_plan.profit_target_pct is not None
-                    and candidate.max_profit is not None
-                    and open_profit >= candidate.max_profit * exit_plan.profit_target_pct
+                    and total_max_profit is not None
+                    and open_profit >= total_max_profit * exit_plan.profit_target_pct
                 ):
                     return snapshot, "profit_target"
                 if (
@@ -194,8 +197,10 @@ def _select_exit_snapshot(
                 ):
                     return snapshot, "stop_loss"
             else:
-                open_profit = (snapshot.mark_price - entry_value) * CONTRACT_MULTIPLIER
-                entry_debit = entry_value * CONTRACT_MULTIPLIER
+                open_profit = (
+                    snapshot.mark_price - entry_value
+                ) * CONTRACT_MULTIPLIER * total_quantity
+                entry_debit = entry_value * CONTRACT_MULTIPLIER * total_quantity
                 if (
                     exit_plan.profit_target_pct is not None
                     and open_profit >= entry_debit * exit_plan.profit_target_pct

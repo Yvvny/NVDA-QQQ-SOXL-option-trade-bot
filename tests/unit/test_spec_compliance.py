@@ -233,6 +233,34 @@ def test_spec_gate_rejects_high_score_trade_above_40pct_equity():
     assert "spec_high_score_trade_risk_above_40pct_equity" in decision.reason_codes
 
 
+def test_spec_gate_rejects_quantity_scaled_trade_above_40pct_equity():
+    candidate = StrategyCandidate(
+        strategy_name="put_credit_spread",
+        underlying="QQQ",
+        legs=(
+            OptionLeg(_contract("put", 450, -0.25, 3.49, 3.51), OptionAction.SELL),
+            OptionLeg(_contract("put", 446, -0.10, 0.49, 0.51), OptionAction.BUY),
+        ),
+        dte=30,
+        entry_score=85,
+        max_profit=300,
+        max_loss=900,
+        expected_credit_or_debit=300,
+        reason_codes=("regime_fit_preferred",),
+        exit_plan=ExitPlan(profit_target_pct=0.5, stop_loss_multiple=2.5),
+        quantity=2,
+    )
+
+    decision = validate_candidate_against_strategy_spec(
+        candidate,
+        regime_label=RegimeLabel.BULL_TREND_HIGH_IV,
+        risk_budget_base=2000,
+    )
+
+    assert decision.approved is False
+    assert "spec_high_score_trade_risk_above_40pct_equity" in decision.reason_codes
+
+
 def _contract(
     option_type: str,
     strike: float,

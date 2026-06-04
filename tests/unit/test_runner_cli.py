@@ -1,6 +1,7 @@
 import json
 from dataclasses import dataclass
 from datetime import UTC, date, datetime
+from pathlib import Path
 
 from trading_bot.cli import main
 from trading_bot.core.enums import OptionType
@@ -58,6 +59,31 @@ def test_runner_can_use_tastytrade_source_with_injected_snapshot(tmp_path):
     assert audit_log.exists()
 
 
+def test_cli_exit_matrix_outputs_summary_and_variant_reports(tmp_path, capsys):
+    scenario_file = tmp_path / "exit_matrix_scenarios.json"
+    output_dir = tmp_path / "reports"
+    scenario_file.write_text(_exit_matrix_fixture_json(), encoding="utf-8")
+
+    exit_code = main(
+        [
+            "exit-matrix",
+            "--scenario-file",
+            str(scenario_file),
+            "--output-dir",
+            str(output_dir),
+        ]
+    )
+
+    output = json.loads(capsys.readouterr().out)
+    assert exit_code == 0
+    assert Path(output["summary_path"]).exists()
+    assert (output_dir / "e1_backtest.json").exists()
+    assert (output_dir / "e2_backtest.json").exists()
+    assert (output_dir / "e3_backtest.json").exists()
+    assert (output_dir / "e4_backtest.json").exists()
+    assert output["report"]["scenario_count"] == 1
+
+
 @dataclass(frozen=True)
 class _FakeTastytradeDataSource:
     def fetch_snapshot(self, symbol: str, target_dte: int):
@@ -102,4 +128,73 @@ def _contract(
         delta=delta,
         volume=100,
         open_interest=1000,
+    )
+
+
+def _exit_matrix_fixture_json() -> str:
+    return json.dumps(
+        {
+            "scenarios": [
+                {
+                    "trade_id": "fixture_1",
+                    "entry_date": "2026-01-01",
+                    "candidate": {
+                        "strategy_name": "put_credit_spread",
+                        "underlying": "QQQ",
+                        "legs": [
+                            {
+                                "action": "sell",
+                                "quantity": 1,
+                                "contract": {
+                                    "symbol": "QQQ 2026-06-19 450 put",
+                                    "underlying": "QQQ",
+                                    "expiration": "2026-06-19",
+                                    "strike": 450,
+                                    "option_type": "put",
+                                    "bid": 0.45,
+                                    "ask": 0.55,
+                                    "mid": 0.50,
+                                    "delta": -0.25,
+                                    "volume": 100,
+                                    "open_interest": 1000,
+                                },
+                            },
+                            {
+                                "action": "buy",
+                                "quantity": 1,
+                                "contract": {
+                                    "symbol": "QQQ 2026-06-19 449 put",
+                                    "underlying": "QQQ",
+                                    "expiration": "2026-06-19",
+                                    "strike": 449,
+                                    "option_type": "put",
+                                    "bid": 0.20,
+                                    "ask": 0.30,
+                                    "mid": 0.25,
+                                    "delta": -0.10,
+                                    "volume": 100,
+                                    "open_interest": 1000,
+                                },
+                            },
+                        ],
+                        "dte": 30,
+                        "entry_score": 80,
+                        "max_profit": 50,
+                        "max_loss": 50,
+                        "expected_credit_or_debit": 50,
+                        "reason_codes": ["fixture"],
+                        "exit_plan": {
+                            "profit_target_pct": 0.5,
+                            "stop_loss_multiple": 2.5,
+                            "time_exit_dte": 21,
+                        },
+                        "quantity": 1,
+                    },
+                    "exit_snapshots": [
+                        {"date": "2026-01-05", "dte": 26, "mark_price": 0.25},
+                        {"date": "2026-01-08", "dte": 23, "mark_price": 0.21},
+                    ],
+                }
+            ]
+        }
     )

@@ -38,6 +38,7 @@ class RiskEngine:
         candidate: StrategyCandidate,
         portfolio_state: PortfolioState,
     ) -> RiskDecision:
+        total_max_loss = candidate.total_max_loss()
         reason_codes: list[str] = []
 
         if portfolio_state.kill_switch.active:
@@ -56,9 +57,9 @@ class RiskEngine:
         ):
             reason_codes.append(REASON_0DTE_FORBIDDEN)
 
-        if candidate.max_loss is None:
+        if total_max_loss is None:
             reason_codes.append(REASON_MISSING_MAX_LOSS)
-        elif candidate.max_loss <= 0:
+        elif total_max_loss <= 0:
             reason_codes.append(REASON_INVALID_MAX_LOSS)
 
         if (
@@ -69,7 +70,7 @@ class RiskEngine:
             reason_codes.append(REASON_MARKET_ORDER_OPTIONS_FORBIDDEN)
 
         if not self.settings.forbidden.allow_naked_options and _has_unprotected_short_option(
-            candidate.legs
+            candidate
         ):
             reason_codes.append(REASON_NAKED_SHORT_OPTION_FORBIDDEN)
             reason_codes.append(REASON_UNDEFINED_RISK_FORBIDDEN)
@@ -81,8 +82,8 @@ class RiskEngine:
             reason_codes.append(REASON_LIQUIDITY_BLOCK)
             reason_codes.extend(candidate.liquidity_warnings)
 
-        if candidate.max_loss is not None and candidate.max_loss > 0:
-            self._evaluate_loss_limits(candidate, portfolio_state, reason_codes)
+        if total_max_loss is not None and total_max_loss > 0:
+            self._evaluate_loss_limits(candidate, portfolio_state, reason_codes, total_max_loss)
 
         self._evaluate_portfolio_limits(candidate, portfolio_state, reason_codes)
 
@@ -91,7 +92,7 @@ class RiskEngine:
         return RiskDecision(
             approved=approved,
             reason_codes=(REASON_APPROVED,) if approved else unique_reason_codes,
-            max_loss=candidate.max_loss,
+            max_loss=total_max_loss,
             adjusted_size=candidate.quantity if approved else None,
         )
 
@@ -100,25 +101,25 @@ class RiskEngine:
         candidate: StrategyCandidate,
         portfolio_state: PortfolioState,
         reason_codes: list[str],
+        total_max_loss: float,
     ) -> None:
         per_trade_limit = self.settings.risk.per_trade_max_loss_cap(
             risk_budget_base=portfolio_state.available_cash,
             entry_score=candidate.entry_score,
         )
-        if candidate.max_loss is not None and candidate.max_loss > per_trade_limit:
+        if total_max_loss > per_trade_limit:
             reason_codes.append(REASON_PER_TRADE_MAX_LOSS_EXCEEDED)
 
         if (
             candidate.underlying.upper() == "SOXL"
-            and candidate.max_loss is not None
-            and candidate.max_loss > self.settings.risk.soxl_per_trade_max_loss
+            and total_max_loss > self.settings.risk.soxl_per_trade_max_loss
         ):
             reason_codes.append(REASON_SOXL_MAX_LOSS_EXCEEDED)
 
         max_total_open_loss = (
             portfolio_state.available_cash * self.settings.risk.total_open_max_loss_pct
         )
-        projected_open_loss = portfolio_state.total_open_max_loss + (candidate.max_loss or 0.0)
+        projected_open_loss = portfolio_state.total_open_max_loss + total_max_loss
         if projected_open_loss > max_total_open_loss:
             reason_codes.append(REASON_TOTAL_OPEN_MAX_LOSS_EXCEEDED)
 
@@ -156,17 +157,17 @@ class RiskEngine:
             reason_codes.append(REASON_STRATEGY_CONCENTRATION_EXCEEDED)
 
 
-def _has_unprotected_short_option(legs: tuple[OptionLeg, ...]) -> bool:
-    short_legs = [leg for leg in legs if leg.action == OptionAction.SELL]
-    long_legs = [leg for leg in legs if leg.action == OptionAction.BUY]
+def _has_unprotected_short_option(candidate: StrategyCandidate) -> bool:
+    short_legs = [leg for leg in candidate.legs if leg.action == OptionAction.SELL]
+    long_legs = [leg for leg in candidate.legs if leg.action == OptionAction.BUY]
 
     for short_leg in short_legs:
         protected_quantity = sum(
-            long_leg.quantity
+            candidate.effective_leg_quantity(long_leg)
             for long_leg in long_legs
             if _protects_short_leg(short_leg=short_leg, long_leg=long_leg)
         )
-        if protected_quantity < short_leg.quantity:
+        if protected_quantity < candidate.effective_leg_quantity(short_leg):
             return True
 
     return False

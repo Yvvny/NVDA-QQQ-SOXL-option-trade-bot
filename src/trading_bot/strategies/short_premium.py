@@ -91,7 +91,10 @@ class ShortPremiumEngine(StrategyEngine):
         short_calls = [
             contract
             for contract in calls
-            if contract.delta is not None and 0.15 <= abs(contract.delta) <= 0.30
+            if contract.delta is not None
+            and self.settings.delta.short_premium_min_abs
+            <= abs(contract.delta)
+            <= self.settings.delta.short_premium_max_abs
         ]
         candidates: list[StrategyCandidate] = []
         for short_call in short_calls:
@@ -146,7 +149,11 @@ def _credit_spread_candidate(
         return None
 
     credit_pct_of_width = credit / width
-    if not 0.15 <= credit_pct_of_width <= 0.35:
+    if not (
+        settings.strategy.credit_spread_min_pct_of_width
+        <= credit_pct_of_width
+        <= settings.strategy.credit_spread_max_pct_of_width
+    ):
         return None
 
     max_profit = round(credit * CONTRACT_MULTIPLIER, 2)

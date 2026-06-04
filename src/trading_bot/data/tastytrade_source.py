@@ -43,6 +43,16 @@ class TastytradeMarketSnapshot:
     market_data_diagnostics: TastytradeMarketDataDiagnostics | None = None
 
 
+@dataclass(frozen=True)
+class TastytradeFullChainSnapshot:
+    symbol: str
+    collected_at: Any
+    expirations: tuple[date, ...]
+    underlying_quote: UnderlyingQuote | None
+    option_contracts: tuple[OptionContract, ...]
+    market_data_diagnostics: TastytradeMarketDataDiagnostics | None = None
+
+
 class TastytradeSdkDataSource:
     def __init__(
         self,
@@ -102,6 +112,9 @@ class TastytradeSdkDataSource:
     def fetch_snapshot(self, symbol: str, target_dte: int) -> TastytradeMarketSnapshot:
         return asyncio.run(self._fetch_snapshot_async(symbol, target_dte))
 
+    def fetch_full_chain_snapshot(self, symbol: str) -> TastytradeFullChainSnapshot:
+        return asyncio.run(self._fetch_full_chain_snapshot_async(symbol))
+
     async def _fetch_snapshot_async(
         self,
         symbol: str,
@@ -150,6 +163,75 @@ class TastytradeSdkDataSource:
                     market_data_incomplete=(
                         received_option_quotes < required_events
                         or received_greeks < required_events
+                    ),
+                ),
+            )
+        finally:
+            client = getattr(session, "_client", None)
+            close = getattr(client, "aclose", None)
+            if close is not None:
+                await close()
+
+    async def _fetch_full_chain_snapshot_async(
+        self,
+        symbol: str,
+    ) -> TastytradeFullChainSnapshot:
+        sdk = self._load_sdk()
+        session = self._create_session(sdk["Session"])
+        try:
+            chain = await _await_if_needed(sdk["get_option_chain"](session, symbol.upper()))
+            ordered_expirations = tuple(sorted(chain))
+            all_options = [
+                option
+                for expiration in ordered_expirations
+                for option in chain.get(expiration, ())
+            ]
+            streamer_symbols = [
+                option.streamer_symbol
+                for option in all_options
+                if getattr(option, "streamer_symbol", None)
+            ]
+            quotes: dict[str, Any] = {}
+            greeks: dict[str, Any] = {}
+            underlying_symbol = symbol.upper()
+            required_option_quotes = 0
+            required_greeks = 0
+            received_option_quotes = 0
+            received_greeks = 0
+            for batch_symbols in _chunk_symbols(streamer_symbols, self.max_contracts):
+                batch_quotes, batch_greeks = await self._fetch_quotes_and_greeks(
+                    session=session,
+                    streamer_factory=sdk["DXLinkStreamer"],
+                    quote_class=sdk["Quote"],
+                    greeks_class=sdk["Greeks"],
+                    symbols=(underlying_symbol, *batch_symbols),
+                    greek_symbols=tuple(batch_symbols),
+                )
+                quotes.update(batch_quotes)
+                greeks.update(batch_greeks)
+                batch_required = _required_option_event_count(len(batch_symbols))
+                required_option_quotes += batch_required
+                required_greeks += batch_required
+                received_option_quotes += _option_quote_count(tuple(batch_symbols), batch_quotes)
+                received_greeks += _greek_count(tuple(batch_symbols), batch_greeks)
+
+            contracts = contracts_from_sdk_options(all_options, quotes, greeks)
+            underlying_quote = underlying_quote_from_streamer(underlying_symbol, quotes)
+            return TastytradeFullChainSnapshot(
+                symbol=underlying_symbol,
+                collected_at=now_new_york(),
+                expirations=ordered_expirations,
+                underlying_quote=underlying_quote,
+                option_contracts=tuple(contracts),
+                market_data_diagnostics=TastytradeMarketDataDiagnostics(
+                    subscribed_option_contracts=len(streamer_symbols),
+                    received_option_quotes=received_option_quotes,
+                    received_greeks=received_greeks,
+                    required_option_quotes=required_option_quotes,
+                    required_greeks=required_greeks,
+                    market_data_incomplete=(
+                        received_option_quotes < required_option_quotes
+                        or received_greeks < required_greeks
                     ),
                 ),
             )
@@ -378,6 +460,12 @@ def _limit_contract_count(options: Sequence[Any], max_contracts: int) -> list[An
     midpoint = len(ordered) // 2
     half = max_contracts // 2
     return ordered[max(0, midpoint - half) : midpoint + half]
+
+
+def _chunk_symbols(symbols: Sequence[str], batch_size: int) -> list[tuple[str, ...]]:
+    if batch_size <= 0:
+        raise ValueError("batch_size must be positive")
+    return [tuple(symbols[index : index + batch_size]) for index in range(0, len(symbols), batch_size)]
 
 
 def _as_events(events: Any) -> list[Any]:

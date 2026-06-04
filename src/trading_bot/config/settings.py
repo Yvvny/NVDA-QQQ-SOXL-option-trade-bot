@@ -85,8 +85,8 @@ class DteConfig:
 
 @dataclass(frozen=True)
 class DeltaConfig:
-    short_premium_min_abs: float = 0.10
-    short_premium_max_abs: float = 0.35
+    short_premium_min_abs: float = 0.16
+    short_premium_max_abs: float = 0.25
     iron_condor_short_min_abs: float = 0.16
     iron_condor_short_max_abs: float = 0.25
     trend_long_min_abs: float = 0.45
@@ -108,6 +108,8 @@ class StrategyConfig:
     min_entry_score: float = 55.0
     good_entry_score: float = 65.0
     high_quality_score: float = 80.0
+    credit_spread_min_pct_of_width: float = 0.18
+    credit_spread_max_pct_of_width: float = 0.35
     credit_spread_profit_target: float = 0.50
     iron_condor_profit_target: float = 0.35
     debit_spread_profit_target: float = 0.75
@@ -115,6 +117,20 @@ class StrategyConfig:
     credit_spread_stop_multiple: float = 2.5
     debit_spread_stop_loss: float = 0.45
     calendar_stop_loss: float = 0.35
+
+
+@dataclass(frozen=True)
+class SizingConfig:
+    low_score_target_risk_pct: float = 0.02
+    good_score_target_risk_pct: float = 0.10
+    high_score_target_risk_pct: float = 0.20
+    low_score_max_contracts: int = 2
+    good_score_max_contracts: int = 10
+    high_score_max_contracts: int = 20
+    same_symbol_multiplier: float = 0.50
+    same_strategy_multiplier: float = 0.75
+    crowded_portfolio_threshold_pct: float = 0.25
+    crowded_portfolio_multiplier: float = 0.75
 
 
 @dataclass(frozen=True)
@@ -127,6 +143,7 @@ class BotSettings:
     delta: DeltaConfig
     execution: ExecutionConfig
     strategy: StrategyConfig
+    sizing: SizingConfig
 
 
 T = TypeVar("T")
@@ -165,6 +182,7 @@ def load_settings(
         delta=_build_dataclass(DeltaConfig, values.get("delta", {})),
         execution=_build_dataclass(ExecutionConfig, values.get("execution", {})),
         strategy=_build_dataclass(StrategyConfig, values.get("strategy", {})),
+        sizing=_build_dataclass(SizingConfig, values.get("sizing", {})),
     )
 
 

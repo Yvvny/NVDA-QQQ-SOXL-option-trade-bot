@@ -22,6 +22,15 @@ def test_order_builder_uses_limit_price_offset_for_credit_spread():
     assert order.limit_price == 0.48
     assert order.max_loss == 100
     assert [leg.action.value for leg in order.legs] == ["sell", "buy"]
+    assert [leg.quantity for leg in order.legs] == [1, 1]
+
+
+def test_order_builder_scales_total_leg_quantity_and_risk_with_candidate_size():
+    order = OrderBuilder().build(_candidate(quantity=3))
+
+    assert [leg.quantity for leg in order.legs] == [3, 3]
+    assert order.max_loss == 300
+    assert order.max_profit == 150
 
 
 def test_dry_run_executor_approves_and_logs_candidate(tmp_path):

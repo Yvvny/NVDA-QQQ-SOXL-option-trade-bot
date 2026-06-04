@@ -1,0 +1,12 @@
+[Unit]
+Description=Trading Bot QQQ Full-Chain Collector
+After=network-online.target
+Wants=network-online.target
+
+[Service]
+Type=oneshot
+User=ubuntu
+Group=ubuntu
+WorkingDirectory=/opt/trading-bot
+Environment=PYTHONUNBUFFERED=1
+ExecStart=/opt/trading-bot/.venv/bin/python -m trading_bot collect-qqq-chain --spool-root data_spool/qqq_option_chain --max-contracts-per-batch 500

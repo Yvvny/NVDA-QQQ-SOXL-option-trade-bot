@@ -11,6 +11,8 @@ def test_default_config_loads_dry_run_mode():
     assert settings.risk.per_trade_max_loss_pct_default == 0.20
     assert settings.risk.per_trade_max_loss_pct_high_score == 0.40
     assert settings.risk.total_open_max_loss_pct == 0.50
+    assert settings.sizing.good_score_target_risk_pct == 0.10
+    assert settings.sizing.high_score_target_risk_pct == 0.20
     assert settings.forbidden.allow_live_trading_default is False
     assert settings.forbidden.allow_0dte is False
     assert settings.forbidden.allow_naked_options is False

@@ -4,6 +4,7 @@ from collections.abc import Sequence
 
 from trading_bot.config.settings import BotSettings, load_settings
 from trading_bot.core.models import OptionContract, StrategyCandidate
+from trading_bot.risk.portfolio import PortfolioState
 
 NON_BLOCKING_LIQUIDITY_WARNINGS = frozenset(
     {
@@ -83,16 +84,22 @@ def blocking_liquidity_warnings(
     )
 
 
-def candidate_quality_score(candidate: StrategyCandidate, risk_cap: float) -> tuple[float, ...]:
+def candidate_quality_score(
+    candidate: StrategyCandidate,
+    risk_cap: float,
+    portfolio_state: PortfolioState | None = None,
+) -> tuple[float, ...]:
     reward_risk = _reward_risk_ratio(candidate)
     spread_quality = _spread_quality_score(candidate)
+    diversification = _diversification_score(candidate, portfolio_state)
     risk_utilization = _risk_utilization_score(candidate, risk_cap)
     max_profit = candidate.max_profit or 0.0
     max_loss = candidate.max_loss or float("inf")
     return (
         reward_risk,
-        candidate.entry_score / 100.0,
         spread_quality,
+        diversification,
+        candidate.entry_score / 100.0,
         risk_utilization,
         max_profit,
         -max_loss,
@@ -122,3 +129,16 @@ def _risk_utilization_score(candidate: StrategyCandidate, risk_cap: float) -> fl
         return 0.0
     utilization = min(candidate.max_loss / risk_cap, 1.5)
     return max(0.0, 1.0 - abs(utilization - 0.60))
+
+
+def _diversification_score(
+    candidate: StrategyCandidate,
+    portfolio_state: PortfolioState | None,
+) -> float:
+    if portfolio_state is None:
+        return 1.0
+
+    symbol_penalty = 0.35 * portfolio_state.open_symbol_count(candidate.underlying)
+    strategy_penalty = 0.15 * portfolio_state.open_strategy_count(candidate.strategy_name)
+    total_penalty = min(symbol_penalty + strategy_penalty, 0.90)
+    return max(0.10, 1.0 - total_penalty)
