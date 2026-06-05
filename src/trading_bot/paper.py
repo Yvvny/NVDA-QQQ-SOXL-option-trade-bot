@@ -19,6 +19,7 @@ from trading_bot.risk.portfolio import OpenPosition, PortfolioState
 from trading_bot.risk.sizing import PositionSizer
 from trading_bot.runner import (
     DryRunBotRunner,
+    _entry_timing_context_for_snapshot,
     _regime_label_for_snapshot,
     _score_inputs_for_snapshot,
 )
@@ -243,6 +244,7 @@ class PaperTradingSimulator:
                 score_inputs = _score_inputs_for_snapshot(
                     regime_label,
                     snapshot.option_contracts,
+                    entry_timing=_entry_timing_context_for_snapshot(snapshot),
                 )
                 portfolio_state = _portfolio_state_from_paper(state)
                 candidates = self.selector.generate_candidates(

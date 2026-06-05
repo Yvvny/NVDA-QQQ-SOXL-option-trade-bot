@@ -26,11 +26,17 @@ from trading_bot.core.time_utils import (
     parse_timestamp,
 )
 from trading_bot.paper import DEFAULT_PAPER_STATE_PATH, PaperTradingSimulator
+from trading_bot.research_bot import (
+    StrategyChatAssistant,
+    StrategyChatMessage,
+)
+from trading_bot.research_bot.openai_client import DEFAULT_RESEARCH_MODEL
 from trading_bot.runner import DryRunBotRunner
 
 DEFAULT_PAPER_AUDIT_LOG_PATH = "docs/reports/paper_audit.jsonl"
 DEFAULT_BOT_TRADE_JOURNAL_PATH = "docs/reports/bot_trade_journal.jsonl"
 DEFAULT_LIVE_EQUITY_HISTORY_PATH = "docs/reports/live_account_equity.jsonl"
+DEFAULT_RESEARCH_QUEUE_PATH = "docs/reports/research_queue.jsonl"
 @dataclass(frozen=True)
 class UiServerConfig:
     host: str = "127.0.0.1"
@@ -138,6 +144,11 @@ class _TradingBotUiHandler(BaseHTTPRequestHandler):
                 }
             )
             return
+        if parsed.path == "/api/research-queue":
+            query = parse_qs(parsed.query)
+            limit = _int_from_query(query, "limit", default=100, minimum=1, maximum=500)
+            self._send_json(_research_queue_payload(limit=limit))
+            return
         self._send_json({"error": "not_found"}, status=HTTPStatus.NOT_FOUND)
 
     def do_POST(self) -> None:
@@ -169,6 +180,18 @@ class _TradingBotUiHandler(BaseHTTPRequestHandler):
                 )
                 return
             self._send_json(result.to_dict())
+            return
+        if parsed.path == "/api/assistant":
+            payload = self._read_json_body()
+            try:
+                result = _assistant_chat_from_payload(payload, self.server_config.audit_log_path)
+            except Exception as exc:  # noqa: BLE001 - surface safe local error details.
+                self._send_json(
+                    {"error": exc.__class__.__name__, "message": str(exc)},
+                    status=HTTPStatus.BAD_REQUEST,
+                )
+                return
+            self._send_json(result)
             return
         self._send_json({"error": "not_found"}, status=HTTPStatus.NOT_FOUND)
 
@@ -278,6 +301,120 @@ def _run_once_from_payload(payload: dict[str, Any], audit_log_path: str):
     return runner.run_once()
 
 
+def _assistant_chat_from_payload(payload: dict[str, Any], audit_log_path: str) -> dict[str, Any]:
+    messages_payload = payload.get("messages", [])
+    if not isinstance(messages_payload, list):
+        raise ValueError("messages must be a list.")
+    messages = tuple(
+        StrategyChatMessage(
+            role=str(item.get("role", "user")),
+            content=str(item.get("content", "")),
+        )
+        for item in messages_payload
+        if isinstance(item, dict) and str(item.get("content", "")).strip()
+    )
+    if not messages:
+        raise ValueError("messages must include at least one non-empty message.")
+
+    mode = str(payload.get("mode", "strategy")).strip() or "strategy"
+    account_type = str(payload.get("account_type", "paper")).strip() or "paper"
+    range_key = str(payload.get("range", "all")).strip() or "all"
+    ledger_filter = str(payload.get("ledger_filter", "all")).strip() or "all"
+    assistant = _build_strategy_chat_assistant()
+    context = {
+        "status": _status_payload(audit_log_path),
+        "account_view": _account_view_payload(
+            account_type,
+            range_key=range_key,
+            ledger_filter=ledger_filter,
+        ),
+        "recent_paper_logs": _read_recent_paper_logs(DEFAULT_PAPER_AUDIT_LOG_PATH, 25),
+    }
+    response = assistant.respond(messages, context=context, mode=mode)
+    queue_item = _append_research_queue_item(
+        response=response,
+        assistant_model=assistant.model,
+        mode=mode,
+        user_message=messages[-1].content,
+        account_type=account_type,
+    )
+    return {
+        "model": assistant.model,
+        "generated_at": response.generated_at.isoformat() if response.generated_at else None,
+        "queued_task": queue_item,
+        "response": response.to_dict(),
+        "research_only": response.research_only,
+        "assistant_reply": response.assistant_reply,
+        "summary": response.summary,
+        "needs_human_approval": response.needs_human_approval,
+        "codex_task": response.codex_task,
+        "proposed_changes": [asdict(item) for item in response.proposed_changes],
+        "follow_up_questions": list(response.follow_up_questions),
+        "confidence": response.confidence,
+    }
+
+
+def _build_strategy_chat_assistant() -> StrategyChatAssistant:
+    return StrategyChatAssistant.from_env()
+
+
+def _append_research_queue_item(
+    *,
+    response: Any,
+    assistant_model: str,
+    mode: str,
+    user_message: str,
+    account_type: str,
+    queue_path: str | Path | None = None,
+) -> dict[str, Any] | None:
+    codex_task = str(getattr(response, "codex_task", "") or "").strip()
+    proposed_changes = tuple(getattr(response, "proposed_changes", ()) or ())
+    if not codex_task and not proposed_changes:
+        return None
+
+    created_at = now_new_york()
+    item = {
+        "queue_id": f"rq_{created_at.strftime('%Y%m%d%H%M%S%f')}",
+        "created_at": created_at.isoformat(),
+        "created_at_new_york": _ny_time_string(created_at.isoformat()),
+        "status": "pending_review",
+        "source": "assistant",
+        "assistant_model": assistant_model,
+        "mode": mode,
+        "account_type": account_type,
+        "user_message": user_message,
+        "summary": getattr(response, "summary", ""),
+        "assistant_reply": getattr(response, "assistant_reply", ""),
+        "codex_task": codex_task,
+        "needs_human_approval": bool(getattr(response, "needs_human_approval", True)),
+        "confidence": float(getattr(response, "confidence", 0.0) or 0.0),
+        "proposed_changes": [asdict(item) for item in proposed_changes],
+        "follow_up_questions": list(getattr(response, "follow_up_questions", ()) or ()),
+    }
+    path = Path(queue_path or DEFAULT_RESEARCH_QUEUE_PATH)
+    path.parent.mkdir(parents=True, exist_ok=True)
+    with path.open("a", encoding="utf-8") as handle:
+        handle.write(json.dumps(_jsonable(item), sort_keys=True) + "\n")
+    return item
+
+
+def _research_queue_payload(
+    *,
+    limit: int = 100,
+    queue_path: str | Path | None = None,
+) -> dict[str, Any]:
+    path = Path(queue_path or DEFAULT_RESEARCH_QUEUE_PATH)
+    items = _read_recent_jsonl(path, limit)
+    items = list(reversed(items))
+    status_counts = Counter(str(item.get("status", "unknown")) for item in items)
+    return {
+        "path": str(path),
+        "count": len(items),
+        "status_counts": dict(status_counts),
+        "items": items,
+    }
+
+
 def _ui_auth_credentials() -> tuple[str, str] | None:
     values = _merged_env()
     username = values.get("UI_AUTH_USERNAME", "").strip()
@@ -347,6 +484,11 @@ def _merged_env() -> dict[str, str]:
     return values
 
 
+def _research_model_default() -> str:
+    values = _merged_env()
+    return values.get("OPENAI_RESEARCH_MODEL", DEFAULT_RESEARCH_MODEL)
+
+
 def _read_dotenv(path: Path) -> dict[str, str]:
     if not path.exists():
         return {}
@@ -375,6 +517,7 @@ def _status_payload(audit_log_path: str) -> dict[str, Any]:
         "audit_log_exists": audit_path.exists(),
         "recent_audit_count": len(recent_records),
         "latest_status": recent_records[-1].get("status") if recent_records else None,
+        "research_model_default": _research_model_default(),
         "server_time": now_new_york().isoformat(),
         "server_time_new_york": _ny_time_string(now_new_york().isoformat()),
     }
@@ -2009,6 +2152,159 @@ _HTML = """<!doctype html>
       grid-template-columns: repeat(3, minmax(0, 1fr));
       gap: 12px;
     }
+    .assistant-shell {
+      display: grid;
+      gap: 16px;
+    }
+    .assistant-layout {
+      display: grid;
+      grid-template-columns: minmax(0, 1.45fr) minmax(320px, 0.85fr);
+      gap: 16px;
+      align-items: start;
+    }
+    .assistant-thread-panel {
+      border: 1px solid var(--border);
+      border-radius: 24px;
+      background: linear-gradient(180deg, rgba(255,255,255,0.97), rgba(247,250,245,0.94));
+      padding: 18px;
+      display: grid;
+      gap: 14px;
+      box-shadow: var(--shadow);
+    }
+    .assistant-thread {
+      min-height: 320px;
+      max-height: 520px;
+      overflow: auto;
+      display: grid;
+      gap: 12px;
+      padding-right: 4px;
+    }
+    .assistant-message {
+      display: grid;
+      gap: 5px;
+      padding: 14px 16px;
+      border-radius: 18px;
+      border: 1px solid var(--border);
+      background: rgba(255,255,255,0.92);
+    }
+    .assistant-message.user {
+      background: linear-gradient(180deg, rgba(0,200,5,0.08), rgba(0,200,5,0.04));
+      border-color: rgba(0,200,5,0.16);
+    }
+    .assistant-message.assistant {
+      background: #0d1610;
+      color: #eff7ef;
+    }
+    .assistant-message.assistant .label,
+    .assistant-message.assistant .muted {
+      color: rgba(239,247,239,0.68);
+    }
+    .assistant-role {
+      font-size: 11px;
+      text-transform: uppercase;
+      letter-spacing: 0.1em;
+      font-weight: 750;
+      color: var(--muted);
+    }
+    .assistant-message.assistant .assistant-role {
+      color: rgba(239,247,239,0.66);
+    }
+    .assistant-content {
+      white-space: pre-wrap;
+      line-height: 1.5;
+      font-size: 13px;
+      overflow-wrap: anywhere;
+    }
+    .assistant-compose {
+      display: grid;
+      gap: 10px;
+    }
+    .assistant-compose textarea {
+      width: 100%;
+      min-height: 120px;
+      resize: vertical;
+      border-radius: 18px;
+      border: 1px solid var(--border);
+      background: rgba(255,255,255,0.92);
+      color: var(--text);
+      padding: 14px 16px;
+      font: inherit;
+      line-height: 1.5;
+    }
+    .assistant-compose-row {
+      display: flex;
+      gap: 10px;
+      flex-wrap: wrap;
+      align-items: center;
+    }
+    .assistant-compose-row select {
+      border: 1px solid var(--border);
+      background: rgba(255,255,255,0.92);
+      color: var(--text);
+      border-radius: 14px;
+      padding: 10px 12px;
+      font: inherit;
+    }
+    .assistant-side {
+      display: grid;
+      gap: 14px;
+    }
+    .assistant-change {
+      border: 1px solid var(--border);
+      background: rgba(255,255,255,0.9);
+      border-radius: 18px;
+      padding: 14px;
+      display: grid;
+      gap: 8px;
+    }
+    .assistant-change-title {
+      font-weight: 760;
+      letter-spacing: -0.02em;
+    }
+    .assistant-change-meta {
+      color: var(--muted);
+      font-size: 12px;
+      line-height: 1.45;
+      display: grid;
+      gap: 4px;
+    }
+    .assistant-code-block {
+      margin: 0;
+      padding: 14px 16px;
+      border-radius: 16px;
+      border: 1px solid var(--border);
+      background: rgba(13,22,16,0.96);
+      color: #eaf4ea;
+      white-space: pre-wrap;
+      overflow-wrap: anywhere;
+      font: inherit;
+      line-height: 1.5;
+      min-height: 120px;
+      max-height: 280px;
+      overflow: auto;
+    }
+    .assistant-empty {
+      color: var(--muted);
+      font-size: 13px;
+      line-height: 1.5;
+      border: 1px dashed var(--border);
+      border-radius: 16px;
+      padding: 14px;
+      background: rgba(255,255,255,0.66);
+    }
+    .assistant-question-list {
+      display: grid;
+      gap: 8px;
+    }
+    .assistant-question {
+      border: 1px solid rgba(0,200,5,0.12);
+      background: rgba(0,200,5,0.06);
+      color: var(--text);
+      padding: 10px 12px;
+      border-radius: 14px;
+      font-size: 12px;
+      line-height: 1.4;
+    }
     .chip-grid {
       display: flex;
       gap: 8px;
@@ -2228,7 +2524,8 @@ _HTML = """<!doctype html>
     @media (max-width: 1160px) {
       .hero,
       .split-panel,
-      .analytics-grid {
+      .analytics-grid,
+      .assistant-layout {
         grid-template-columns: 1fr;
       }
       .metric-grid {
@@ -2251,6 +2548,9 @@ _HTML = """<!doctype html>
       .position-meta-grid,
       .position-exit-lines {
         grid-template-columns: repeat(2, minmax(0, 1fr));
+      }
+      .assistant-compose-row {
+        justify-content: stretch;
       }
       .diagnostic-form {
         grid-template-columns: 1fr 1fr;
@@ -2425,18 +2725,79 @@ _HTML = """<!doctype html>
       </div>
     </section>
 
+    <section class="assistant-shell">
+      <div class="section-header">
+        <h2>Research Assistant</h2>
+        <div class="toolbar">
+          <span class="pill" id="assistant-model-pill">model: N/A</span>
+          <span class="pill" id="assistant-response-pill">research-only</span>
+        </div>
+      </div>
+      <div class="assistant-layout">
+        <div class="assistant-thread-panel">
+          <div class="section-header">
+            <div>
+              <h2>Conversation</h2>
+              <div class="muted">Ask about strategy state, open risk, or research changes. Strategy edits are returned as Codex-ready tasks, not auto-applied.</div>
+            </div>
+            <div class="toolbar">
+              <button class="secondary" type="button" id="assistant-clear">Clear</button>
+            </div>
+          </div>
+          <div id="assistant-thread" class="assistant-thread"></div>
+          <div class="assistant-compose">
+            <textarea id="assistant-input" placeholder="Ask a strategy question, ask for a report summary, or request a Codex-ready change proposal."></textarea>
+            <div class="assistant-compose-row">
+              <select id="assistant-mode">
+                <option value="strategy">Strategy</option>
+                <option value="review">Review</option>
+                <option value="report">Report</option>
+              </select>
+              <button class="secondary" type="button" id="assistant-suggest-state">Ask about current state</button>
+              <button class="secondary" type="button" id="assistant-suggest-improve">Suggest an improvement</button>
+              <button class="primary" type="button" id="assistant-send">Send</button>
+            </div>
+          </div>
+        </div>
+        <div class="assistant-side">
+          <div class="assistant-change">
+            <div class="assistant-change-title">Codex Task</div>
+            <div class="assistant-change-meta">Copy this into Codex to draft or modify strategy code after human review.</div>
+            <pre id="assistant-codex-task" class="assistant-code-block">No task yet.</pre>
+            <div class="toolbar">
+              <button class="secondary" type="button" id="assistant-copy-task">Copy Task</button>
+            </div>
+          </div>
+          <div class="assistant-change">
+            <div class="assistant-change-title">Proposed Changes</div>
+            <div id="assistant-proposed-changes" class="stack"></div>
+          </div>
+          <div class="assistant-change">
+            <div class="assistant-change-title">Assistant Summary</div>
+            <div id="assistant-summary" class="assistant-change-meta">No assistant response yet.</div>
+            <div class="assistant-change-meta" style="margin-top: 8px;">
+              <div>Needs human approval: <span id="assistant-needs-approval">N/A</span></div>
+              <div>Confidence: <span id="assistant-confidence">N/A</span></div>
+              <div>Follow-up questions: <span id="assistant-follow-ups">N/A</span></div>
+            </div>
+          </div>
+        </div>
+      </div>
+    </section>
+
     <section class="activity-shell">
       <div class="activity-tabs">
         <div>
           <h2 style="margin-bottom: 6px;">Activity</h2>
           <div class="muted">Switch between holdings, ledger flow, and realized exits</div>
         </div>
-        <div class="activity-tab-buttons">
-          <button class="secondary activity-tab active" data-activity="positions" type="button">Positions</button>
-          <button class="secondary activity-tab" data-activity="ledger" type="button">Ledger</button>
-          <button class="secondary activity-tab" data-activity="closed" type="button">Closed Trades</button>
-        </div>
+      <div class="activity-tab-buttons">
+        <button class="secondary activity-tab active" data-activity="positions" type="button">Positions</button>
+        <button class="secondary activity-tab" data-activity="ledger" type="button">Ledger</button>
+        <button class="secondary activity-tab" data-activity="closed" type="button">Closed Trades</button>
+        <button class="secondary activity-tab" data-activity="research-queue" type="button">Research Queue</button>
       </div>
+    </div>
 
       <div id="activity-positions" class="activity-panel active">
         <div class="split-panel">
@@ -2502,7 +2863,19 @@ _HTML = """<!doctype html>
             <thead><tr><th>Symbol</th><th>Strategy</th><th>Closed</th><th>Reason</th><th>Realized P/L</th></tr></thead>
             <tbody id="closed-body"></tbody>
           </table>
+      </div>
+    </div>
+
+      <div id="activity-research-queue" class="activity-panel">
+        <div class="section-header">
+          <h2>Research Queue</h2>
+          <div class="toolbar">
+            <div class="muted">Assistant-generated Codex tasks awaiting human review</div>
+            <button class="secondary" type="button" id="refresh-research-queue">Refresh Queue</button>
+          </div>
         </div>
+        <div id="research-queue-summary" class="chip-grid"></div>
+        <div id="research-queue-list" class="stack"></div>
       </div>
     </section>
 
@@ -2572,10 +2945,16 @@ _HTML = """<!doctype html>
     const accountViewUrl = "/api/account-view";
     const logsUrl = "/api/logs";
     const runUrl = "/api/run-once";
+    const assistantUrl = "/api/assistant";
+    const researchQueueUrl = "/api/research-queue";
+    const assistantStorageKey = "strategy-assistant-thread-v1";
     let currentAccount = "paper";
     let currentRange = "all";
     let currentLedgerFilter = "all";
     let currentActivity = "positions";
+    let assistantMessages = [];
+    let assistantBusy = false;
+    let researchQueueItems = [];
 
     function text(id, value) {
       document.getElementById(id).textContent = value ?? "";
@@ -2647,6 +3026,178 @@ _HTML = """<!doctype html>
           <span class="chip-count">${safe(item[1])}</span>
         </span>
       `).join("");
+    }
+
+    function loadAssistantMessages() {
+      try {
+        const raw = localStorage.getItem(assistantStorageKey);
+        if (!raw) {
+          assistantMessages = [];
+          return;
+        }
+        const parsed = JSON.parse(raw);
+        assistantMessages = Array.isArray(parsed)
+          ? parsed
+              .filter(item => item && typeof item === "object")
+              .map(item => ({
+                role: String(item.role || "assistant"),
+                content: String(item.content || "")
+              }))
+              .filter(item => item.content.trim())
+              .slice(-24)
+          : [];
+      } catch {
+        assistantMessages = [];
+      }
+    }
+
+    function saveAssistantMessages() {
+      try {
+        localStorage.setItem(assistantStorageKey, JSON.stringify(assistantMessages.slice(-24)));
+      } catch {
+        return;
+      }
+    }
+
+    function renderAssistantThread() {
+      const thread = document.getElementById("assistant-thread");
+      if (!assistantMessages.length) {
+        thread.innerHTML = `
+          <div class="assistant-empty">
+            Ask about the current strategy state, explain a trade, or request a Codex-ready change proposal.
+            The assistant will stay research-only and will not modify code automatically.
+          </div>
+        `;
+        return;
+      }
+      thread.innerHTML = assistantMessages.map(message => `
+        <article class="assistant-message ${safe(message.role === "user" ? "user" : "assistant")}">
+          <div class="assistant-role">${safe(message.role === "user" ? "You" : "Assistant")}</div>
+          <div class="assistant-content">${safe(message.content)}</div>
+        </article>
+      `).join("");
+      thread.scrollTop = thread.scrollHeight;
+    }
+
+    function renderAssistantResponse(response) {
+      text("assistant-summary", response.summary || "No summary provided.");
+      text("assistant-needs-approval", response.needs_human_approval ? "Yes" : "No");
+      text("assistant-confidence", Number.isFinite(Number(response.confidence)) ? `${Number(response.confidence).toFixed(2)}` : "N/A");
+      text(
+        "assistant-follow-ups",
+        (response.follow_up_questions || []).length
+          ? (response.follow_up_questions || []).join(" | ")
+          : "None"
+      );
+      document.getElementById("assistant-codex-task").textContent = response.codex_task || "No task yet.";
+      const changes = (response.proposed_changes || []).map(change => `
+        <article class="assistant-change">
+          <div class="assistant-change-title">${safe(change.title)}</div>
+          <div class="assistant-change-meta">
+            <div>${safe(change.rationale || "No rationale.")}</div>
+            <div><strong>Files:</strong> ${safe((change.files || []).join(", ") || "N/A")}</div>
+            <div><strong>Validation:</strong> ${safe((change.validation || []).join(", ") || "N/A")}</div>
+            <div><strong>Risk:</strong> ${safe(change.risk_impact || "N/A")}</div>
+          </div>
+        </article>
+      `);
+      document.getElementById("assistant-proposed-changes").innerHTML = changes.join("")
+        || '<div class="assistant-empty">No proposed code changes were returned.</div>';
+      document.getElementById("assistant-response-pill").textContent = response.research_only ? "research-only" : "non-research";
+    }
+
+    function resetAssistantSidePanel() {
+      text("assistant-summary", "No assistant response yet.");
+      text("assistant-needs-approval", "N/A");
+      text("assistant-confidence", "N/A");
+      text("assistant-follow-ups", "N/A");
+      document.getElementById("assistant-codex-task").textContent = "No task yet.";
+      document.getElementById("assistant-proposed-changes").innerHTML = '<div class="assistant-empty">No proposed code changes yet.</div>';
+      document.getElementById("assistant-response-pill").textContent = "research-only";
+    }
+
+    function appendAssistantMessage(role, content) {
+      assistantMessages.push({
+        role: role === "user" ? "user" : "assistant",
+        content: String(content || "")
+      });
+      assistantMessages = assistantMessages.slice(-24);
+      saveAssistantMessages();
+      renderAssistantThread();
+    }
+
+    async function submitAssistantMessage(promptText = null) {
+      if (assistantBusy) {
+        return;
+      }
+      const input = document.getElementById("assistant-input");
+      const message = (promptText ?? input.value ?? "").trim();
+      if (!message) {
+        return;
+      }
+      const mode = document.getElementById("assistant-mode").value || "strategy";
+      assistantBusy = true;
+      document.getElementById("assistant-send").disabled = true;
+      appendAssistantMessage("user", message);
+      input.value = "";
+      try {
+        const payload = {
+          messages: assistantMessages,
+          mode,
+          account_type: currentAccount,
+          range: currentRange,
+          ledger_filter: currentLedgerFilter
+        };
+        const response = await apiFetch(assistantUrl, {
+          method: "POST",
+          headers: {"Content-Type": "application/json"},
+          body: JSON.stringify(payload)
+        });
+        const result = await response.json();
+        if (!response.ok || result.error) {
+          throw new Error(result.message || result.error || `Assistant request failed (${response.status})`);
+        }
+        if (result && result.assistant_reply) {
+          appendAssistantMessage("assistant", result.assistant_reply);
+        } else {
+          appendAssistantMessage("assistant", "No assistant reply was returned.");
+        }
+        renderAssistantResponse(result || {});
+        await loadResearchQueue();
+      } catch (error) {
+        text("assistant-summary", `Assistant request failed: ${error.message || error}`);
+        text("assistant-needs-approval", "N/A");
+        text("assistant-confidence", "N/A");
+        text("assistant-follow-ups", "N/A");
+        document.getElementById("assistant-response-pill").textContent = "error";
+        appendAssistantMessage("assistant", `Assistant request failed: ${error.message || error}`);
+      } finally {
+        assistantBusy = false;
+        document.getElementById("assistant-send").disabled = false;
+      }
+    }
+
+    async function copyAssistantCodexTask() {
+      const textValue = document.getElementById("assistant-codex-task").textContent || "";
+      if (!textValue.trim()) {
+        return;
+      }
+      try {
+        await navigator.clipboard.writeText(textValue);
+        document.getElementById("assistant-copy-task").textContent = "Copied";
+        setTimeout(() => {
+          document.getElementById("assistant-copy-task").textContent = "Copy Task";
+        }, 1200);
+      } catch {
+        const selection = window.getSelection();
+        const range = document.createRange();
+        const node = document.getElementById("assistant-codex-task");
+        range.selectNodeContents(node);
+        selection.removeAllRanges();
+        selection.addRange(range);
+        document.execCommand("copy");
+        selection.removeAllRanges();
+      }
     }
 
     function setActivityPanel(activity) {
@@ -2763,9 +3314,52 @@ _HTML = """<!doctype html>
       };
     }
 
+    async function loadResearchQueue() {
+      const payload = await apiFetch(`${researchQueueUrl}?limit=100`).then(r => r.json());
+      researchQueueItems = payload.items || [];
+      renderResearchQueue(payload);
+    }
+
+    function renderResearchQueue(payload = {}) {
+      const counts = payload.status_counts || {};
+      document.getElementById("research-queue-summary").innerHTML = chipMarkup(Object.entries(counts), "No queued research tasks");
+      const items = researchQueueItems.map(item => {
+        const changes = (item.proposed_changes || []).map(change => `
+          <div class="assistant-question">
+            <strong>${safe(change.title || "Proposed change")}</strong><br>
+            ${safe(change.rationale || "")}<br>
+            Files: ${safe((change.files || []).join(", ") || "N/A")}
+          </div>
+        `).join("");
+        return `
+          <article class="assistant-change">
+            <div class="section-header" style="align-items: start;">
+              <div>
+                <div class="assistant-change-title">${safe(item.summary || "Research task")}</div>
+                <div class="assistant-change-meta">
+                  <div>${safe(item.created_at_new_york || timeNy(item.created_at))}</div>
+                  <div>${safe(item.status || "pending_review")} | ${safe(item.assistant_model || "N/A")} | confidence ${safe(item.confidence ?? "N/A")}</div>
+                </div>
+              </div>
+              <span class="pill">${safe(item.mode || "strategy")}</span>
+            </div>
+            <div class="assistant-change-meta">
+              <div><strong>User ask:</strong> ${safe(item.user_message || "N/A")}</div>
+              <div><strong>Approval:</strong> ${item.needs_human_approval ? "Required" : "Not required"}</div>
+            </div>
+            <pre class="assistant-code-block">${safe(item.codex_task || "No Codex task.")}</pre>
+            ${changes ? `<div class="assistant-question-list">${changes}</div>` : ""}
+          </article>
+        `;
+      });
+      document.getElementById("research-queue-list").innerHTML = items.join("")
+        || '<div class="assistant-empty">No assistant-generated Codex tasks are queued yet.</div>';
+    }
+
     async function loadStatus() {
       const status = await apiFetch(statusUrl).then(r => r.json());
       text("mode-pill", status.mode);
+      text("assistant-model-pill", `model: ${status.research_model_default || "N/A"}`);
     }
 
     async function loadAccountView() {
@@ -2973,6 +3567,34 @@ _HTML = """<!doctype html>
     document.getElementById("show-raw-logs").addEventListener("click", () => {
       document.getElementById("raw-logs-section").scrollIntoView({behavior: "smooth"});
     });
+    document.getElementById("assistant-send").addEventListener("click", () => {
+      submitAssistantMessage();
+    });
+    document.getElementById("assistant-clear").addEventListener("click", () => {
+      assistantMessages = [];
+      saveAssistantMessages();
+      renderAssistantThread();
+      resetAssistantSidePanel();
+      document.getElementById("assistant-input").value = "";
+    });
+    document.getElementById("assistant-copy-task").addEventListener("click", copyAssistantCodexTask);
+    document.getElementById("refresh-research-queue").addEventListener("click", loadResearchQueue);
+    document.getElementById("assistant-suggest-state").addEventListener("click", () => {
+      document.getElementById("assistant-input").value =
+        "Summarize the current account state, open positions, total open risk, and the main strategy bottlenecks.";
+      document.getElementById("assistant-input").focus();
+    });
+    document.getElementById("assistant-suggest-improve").addEventListener("click", () => {
+      document.getElementById("assistant-input").value =
+        "Propose one research-only strategy improvement based on the current account, and format it as a Codex-ready task.";
+      document.getElementById("assistant-input").focus();
+    });
+    document.getElementById("assistant-input").addEventListener("keydown", event => {
+      if ((event.ctrlKey || event.metaKey) && event.key === "Enter") {
+        event.preventDefault();
+        submitAssistantMessage();
+      }
+    });
     document.getElementById("run-form").addEventListener("submit", async event => {
       event.preventDefault();
       const button = document.getElementById("run-once");
@@ -3023,6 +3645,9 @@ _HTML = """<!doctype html>
     });
 
     async function initialize() {
+      loadAssistantMessages();
+      renderAssistantThread();
+      resetAssistantSidePanel();
       const session = await fetch(sessionUrl).then(r => r.json());
       if (!session.authenticated) {
         showLogin();
@@ -3031,6 +3656,7 @@ _HTML = """<!doctype html>
       setActivityPanel(currentActivity);
       showApp();
       await loadAccountView();
+      await loadResearchQueue();
     }
 
     initialize();

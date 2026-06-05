@@ -12,8 +12,13 @@ from trading_bot.api.server import (
     _ny_time_string,
     _paper_position_view,
     _read_recent_paper_logs,
+    _research_queue_payload,
 )
 from trading_bot.cli import build_parser
+from trading_bot.research_bot.chat_assistant import (
+    StrategyChangeProposal,
+    StrategyChatResponse,
+)
 
 
 def test_cli_exposes_ui_command():
@@ -54,6 +59,7 @@ def test_ui_server_serves_status_and_runs_dry_run(tmp_path):
         thread.join(timeout=5)
 
     assert status["mode"] == "dry_run"
+    assert status["research_model_default"] == "gpt-5.5"
     assert status["server_time"].endswith("-04:00") or status["server_time"].endswith("-05:00")
     assert account["source"] == "tastytrade"
     assert isinstance(account["connected"], bool)
@@ -68,6 +74,8 @@ def test_ui_server_serves_status_and_runs_dry_run(tmp_path):
     assert "candidate_dry_run" in event_types
     assert "Trading Bot Control" in html
     assert "account-select" in html
+    assert "Research Assistant" in html
+    assert "Research Queue" in html
 
 
 def test_ui_server_requires_basic_auth_when_configured(monkeypatch):
@@ -121,6 +129,74 @@ def test_ui_server_requires_basic_auth_when_configured(monkeypatch):
     assert login_payload["ok"] is True
     assert payload["ok"] is True
     assert logout_payload["ok"] is True
+
+
+def test_ui_server_assistant_endpoint_returns_codex_ready_response(monkeypatch, tmp_path):
+    from trading_bot.api import server
+
+    queue_path = tmp_path / "research_queue.jsonl"
+    response = StrategyChatResponse(
+        research_only=True,
+        assistant_reply="Use a cool-down window before the first NVDA trend entry.",
+        summary="The first entry looked early and should be delayed.",
+        needs_human_approval=True,
+        codex_task="Add an opening cool-down filter for NVDA trend entries and validate with paper replay.",
+        proposed_changes=(
+            StrategyChangeProposal(
+                title="Add opening cool-down",
+                rationale="Avoid chasing the first minutes of the session.",
+                files=("src/trading_bot/strategies/trend_participation.py",),
+                validation=("pytest tests/unit/test_strategy_scoring.py",),
+                risk_impact="Reduces false positives; may reduce trade count.",
+            ),
+        ),
+        follow_up_questions=("Should this apply to QQQ too?",),
+        confidence=0.83,
+        generated_at=server.parse_timestamp("2026-06-04T10:00:00-04:00"),
+    )
+
+    class _FakeAssistant:
+        model = "gpt-5.5"
+
+        def respond(self, messages, *, context, mode):
+            self.messages = messages
+            self.context = context
+            self.mode = mode
+            return response
+
+    monkeypatch.setattr(server, "_build_strategy_chat_assistant", lambda: _FakeAssistant())
+    monkeypatch.setattr(server, "DEFAULT_RESEARCH_QUEUE_PATH", str(queue_path))
+    server_instance = build_ui_server(UiServerConfig(host="127.0.0.1", port=0))
+    thread = threading.Thread(target=server_instance.serve_forever, daemon=True)
+    thread.start()
+    base_url = f"http://{server_instance.server_address[0]}:{server_instance.server_address[1]}"
+
+    try:
+        payload = {
+            "messages": [{"role": "user", "content": "Review the first NVDA trade today."}],
+            "mode": "strategy",
+            "account_type": "paper",
+            "range": "all",
+            "ledger_filter": "all",
+        }
+        response_payload = _post_json(f"{base_url}/api/assistant", payload)
+    finally:
+        server_instance.shutdown()
+        server_instance.server_close()
+        thread.join(timeout=5)
+
+    assert response_payload["model"] == "gpt-5.5"
+    assert response_payload["research_only"] is True
+    assert response_payload["assistant_reply"].startswith("Use a cool-down window")
+    assert response_payload["codex_task"].startswith("Add an opening cool-down")
+    assert response_payload["queued_task"]["codex_task"].startswith("Add an opening cool-down")
+    assert response_payload["proposed_changes"][0]["title"] == "Add opening cool-down"
+    assert response_payload["follow_up_questions"] == ["Should this apply to QQQ too?"]
+
+    queue_payload = _research_queue_payload(queue_path=queue_path)
+    assert queue_payload["count"] == 1
+    assert queue_payload["items"][0]["status"] == "pending_review"
+    assert queue_payload["items"][0]["codex_task"].startswith("Add an opening cool-down")
 
 
 def test_live_position_view_labels_manual_and_bot_managed_positions():

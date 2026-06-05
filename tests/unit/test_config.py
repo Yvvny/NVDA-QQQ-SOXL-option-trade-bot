@@ -13,6 +13,11 @@ def test_default_config_loads_dry_run_mode():
     assert settings.risk.total_open_max_loss_pct == 0.50
     assert settings.sizing.good_score_target_risk_pct == 0.10
     assert settings.sizing.high_score_target_risk_pct == 0.20
+    assert settings.strategy.debit_spread_opening_cooldown_minutes == 20
+    assert settings.strategy.debit_spread_require_price_action_confirmation is True
+    assert settings.strategy.debit_spread_anti_chase_atr_multiple == 1.0
+    assert settings.strategy.debit_spread_anti_chase_hard_atr_multiple == 1.5
+    assert settings.strategy.debit_spread_anti_chase_candle_count == 3
     assert settings.forbidden.allow_live_trading_default is False
     assert settings.forbidden.allow_0dte is False
     assert settings.forbidden.allow_naked_options is False

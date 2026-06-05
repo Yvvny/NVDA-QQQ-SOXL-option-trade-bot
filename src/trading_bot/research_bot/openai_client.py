@@ -9,6 +9,8 @@ from dataclasses import dataclass
 from pathlib import Path
 from typing import Any
 
+DEFAULT_RESEARCH_MODEL = "gpt-5.5"
+
 
 class OpenAIResearchClientError(RuntimeError):
     pass
@@ -17,7 +19,7 @@ class OpenAIResearchClientError(RuntimeError):
 @dataclass(frozen=True)
 class OpenAIResearchClient:
     api_key: str
-    model: str = "gpt-5.5"
+    model: str = DEFAULT_RESEARCH_MODEL
     timeout_seconds: float = 60.0
 
     @classmethod
@@ -33,7 +35,7 @@ class OpenAIResearchClient:
             raise OpenAIResearchClientError("OPENAI_API_KEY is required for research-review.")
         return cls(
             api_key=api_key,
-            model=model or values.get("OPENAI_RESEARCH_MODEL", "gpt-5.5"),
+            model=model or values.get("OPENAI_RESEARCH_MODEL", DEFAULT_RESEARCH_MODEL),
         )
 
     def complete_json(self, prompt: str) -> str:

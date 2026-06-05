@@ -117,6 +117,13 @@ class StrategyConfig:
     credit_spread_stop_multiple: float = 2.5
     debit_spread_stop_loss: float = 0.45
     calendar_stop_loss: float = 0.35
+    debit_spread_opening_cooldown_minutes: int = 20
+    debit_spread_require_price_action_confirmation: bool = True
+    debit_spread_anti_chase_atr_multiple: float = 1.0
+    debit_spread_anti_chase_hard_atr_multiple: float = 1.5
+    debit_spread_anti_chase_candle_count: int = 3
+    debit_spread_strong_candle_body_pct: float = 0.60
+    debit_spread_strong_candle_min_body_atr_multiple: float = 0.50
 
 
 @dataclass(frozen=True)

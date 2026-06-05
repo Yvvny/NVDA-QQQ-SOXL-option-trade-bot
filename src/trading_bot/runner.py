@@ -16,6 +16,7 @@ from trading_bot.storage.audit import JsonlAuditLogger
 from trading_bot.strategies.diagnostics import build_scan_diagnostics
 from trading_bot.strategies.scoring import StrategyScoreInput
 from trading_bot.strategies.selector import StrategySelector
+from trading_bot.strategies.timing_filters import EntryTimingContext
 
 
 @dataclass(frozen=True)
@@ -73,7 +74,12 @@ class DryRunBotRunner:
         snapshot = self._load_snapshot()
         regime_label = _regime_label_for_snapshot(snapshot)
         contracts = snapshot.option_contracts
-        score_inputs = _score_inputs_for_snapshot(regime_label, contracts)
+        entry_timing = _entry_timing_context_for_snapshot(snapshot)
+        score_inputs = _score_inputs_for_snapshot(
+            regime_label,
+            contracts,
+            entry_timing=entry_timing,
+        )
         portfolio_state = PortfolioState(account_equity=self.settings.account.assumed_equity)
         candidates = self.selector.generate_candidates(
             contracts=contracts,
@@ -199,6 +205,8 @@ def _fallback_regime_label() -> RegimeLabel:
 def _score_inputs_for_snapshot(
     regime_label: RegimeLabel,
     contracts: tuple[OptionContract, ...],
+    *,
+    entry_timing: EntryTimingContext | None = None,
 ) -> tuple[StrategyScoreInput, ...]:
     bid_ask_pct = _median_bid_ask_pct_of_mid(contracts)
     volume, open_interest = _activity_from_contracts(contracts)
@@ -213,6 +221,7 @@ def _score_inputs_for_snapshot(
             price_above_ema20=None,
             price_above_vwap=None,
             breakout_or_pullback_confirmed=False,
+            entry_timing=entry_timing,
         ),
         StrategyScoreInput(
             strategy_name="call_credit_spread",
@@ -224,6 +233,7 @@ def _score_inputs_for_snapshot(
             price_above_ema20=None,
             price_above_vwap=None,
             breakout_or_pullback_confirmed=False,
+            entry_timing=entry_timing,
         ),
         StrategyScoreInput(
             strategy_name="call_debit_spread",
@@ -235,6 +245,7 @@ def _score_inputs_for_snapshot(
             price_above_ema20=None,
             price_above_vwap=None,
             breakout_or_pullback_confirmed=False,
+            entry_timing=entry_timing,
         ),
         StrategyScoreInput(
             strategy_name="put_debit_spread",
@@ -246,7 +257,16 @@ def _score_inputs_for_snapshot(
             price_above_ema20=None,
             price_above_vwap=None,
             breakout_or_pullback_confirmed=False,
+            entry_timing=entry_timing,
         ),
+    )
+
+
+def _entry_timing_context_for_snapshot(snapshot: TastytradeMarketSnapshot) -> EntryTimingContext:
+    quote = snapshot.underlying_quote
+    return EntryTimingContext(
+        timestamp=quote.timestamp if quote is not None else None,
+        underlying_price=quote.last if quote is not None else None,
     )
 
 

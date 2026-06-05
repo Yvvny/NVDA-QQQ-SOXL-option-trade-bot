@@ -72,6 +72,13 @@ strategy:
   credit_spread_stop_multiple: 2.5
   debit_spread_stop_loss: 0.45
   calendar_stop_loss: 0.35
+  debit_spread_opening_cooldown_minutes: 20
+  debit_spread_require_price_action_confirmation: true
+  debit_spread_anti_chase_atr_multiple: 1.0
+  debit_spread_anti_chase_hard_atr_multiple: 1.5
+  debit_spread_anti_chase_candle_count: 3
+  debit_spread_strong_candle_body_pct: 0.60
+  debit_spread_strong_candle_min_body_atr_multiple: 0.50
 
 sizing:
   low_score_target_risk_pct: 0.02

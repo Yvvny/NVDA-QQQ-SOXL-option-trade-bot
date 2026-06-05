@@ -40,6 +40,7 @@ class StrategySelector:
                 dte=dte,
                 score=score,
                 risk_budget_base=risk_budget_base,
+                entry_timing=score_input.entry_timing,
             )
             if candidate is not None:
                 candidates.append(candidate)
@@ -67,6 +68,7 @@ class StrategySelector:
         dte,
         score,
         risk_budget_base: float | None = None,
+        entry_timing=None,
     ):
         if strategy_name == "put_credit_spread":
             return self.short_premium.generate_put_credit_spread(
@@ -91,6 +93,7 @@ class StrategySelector:
                 dte,
                 score,
                 risk_budget_base=risk_budget_base,
+                entry_timing=entry_timing,
             )
         if strategy_name == "put_debit_spread":
             return self.trend.generate_put_debit_spread(
@@ -99,6 +102,7 @@ class StrategySelector:
                 dte,
                 score,
                 risk_budget_base=risk_budget_base,
+                entry_timing=entry_timing,
             )
         if strategy_name == "iron_condor":
             return self.neutral_range.generate_iron_condor(contracts, underlying, dte, score)

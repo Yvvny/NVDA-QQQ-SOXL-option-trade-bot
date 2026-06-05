@@ -1,10 +1,12 @@
-from datetime import date
+from datetime import date, datetime
 
 from trading_bot.core.enums import OptionType
-from trading_bot.core.models import OptionContract
+from trading_bot.core.models import Candle, OptionContract
+from trading_bot.core.time_utils import NEW_YORK_TIME_ZONE
 from trading_bot.regime import RegimeLabel
 from trading_bot.strategies.base import contract_liquidity_warnings
 from trading_bot.strategies import (
+    EntryTimingContext,
     ShortPremiumEngine,
     StrategyScoreInput,
     TrendParticipationEngine,
@@ -140,6 +142,108 @@ def test_call_debit_spread_candidate_has_correct_legs_and_max_loss():
     assert candidate.max_loss == 50
 
 
+def test_call_debit_spread_requires_price_action_confirmation():
+    score = score_strategy_setup(
+        StrategyScoreInput(
+            strategy_name="call_debit_spread",
+            regime_label=RegimeLabel.BULL_TREND_LOW_MID_IV,
+            iv_rank=30,
+            bid_ask_pct_of_mid=0.08,
+            volume=100,
+            open_interest=1000,
+            price_above_ema20=True,
+            price_above_vwap=True,
+            breakout_or_pullback_confirmed=False,
+        )
+    )
+
+    candidate = TrendParticipationEngine().generate_call_debit_spread(
+        contracts=[
+            _contract("call", 450, 0.55, 0.78, 0.82),
+            _contract("call", 452, 0.30, 0.29, 0.31),
+        ],
+        underlying="QQQ",
+        dte=21,
+        score=score,
+        entry_timing=_entry_timing(hour=10, minute=0),
+    )
+
+    assert score.total >= 80
+    assert "price_action_confirmed" not in score.reason_codes
+    assert candidate is None
+
+
+def test_call_debit_spread_opening_cooldown_rejects_until_0950():
+    score = _score("call_debit_spread", RegimeLabel.BULL_TREND_LOW_MID_IV, iv_rank=30)
+    engine = TrendParticipationEngine()
+    contracts = [
+        _contract("call", 450, 0.55, 0.78, 0.82),
+        _contract("call", 452, 0.30, 0.29, 0.31),
+    ]
+
+    at_0935 = engine.generate_call_debit_spread(
+        contracts=contracts,
+        underlying="QQQ",
+        dte=21,
+        score=score,
+        entry_timing=_entry_timing(hour=9, minute=35),
+    )
+    at_0949 = engine.generate_call_debit_spread(
+        contracts=contracts,
+        underlying="QQQ",
+        dte=21,
+        score=score,
+        entry_timing=_entry_timing(hour=9, minute=49),
+    )
+    at_0950 = engine.generate_call_debit_spread(
+        contracts=contracts,
+        underlying="QQQ",
+        dte=21,
+        score=score,
+        entry_timing=_entry_timing(hour=9, minute=50),
+    )
+
+    assert at_0935 is None
+    assert at_0949 is None
+    assert at_0950 is not None
+    assert "timing_opening_cooldown_clear" in at_0950.reason_codes
+
+
+def test_call_debit_spread_anti_chase_rejects_vwap_atr_extension():
+    score = _score("call_debit_spread", RegimeLabel.BULL_TREND_LOW_MID_IV, iv_rank=30)
+
+    candidate = TrendParticipationEngine().generate_call_debit_spread(
+        contracts=[
+            _contract("call", 450, 0.55, 0.78, 0.82),
+            _contract("call", 452, 0.30, 0.29, 0.31),
+        ],
+        underlying="QQQ",
+        dte=21,
+        score=score,
+        entry_timing=_entry_timing(hour=10, minute=0, price=104.0, vwap=100.0, atr=2.0),
+    )
+
+    assert candidate is None
+
+
+def test_call_debit_spread_vwap_atr_warning_does_not_hard_reject():
+    score = _score("call_debit_spread", RegimeLabel.BULL_TREND_LOW_MID_IV, iv_rank=30)
+
+    candidate = TrendParticipationEngine().generate_call_debit_spread(
+        contracts=[
+            _contract("call", 450, 0.55, 0.78, 0.82),
+            _contract("call", 452, 0.30, 0.29, 0.31),
+        ],
+        underlying="QQQ",
+        dte=21,
+        score=score,
+        entry_timing=_entry_timing(hour=10, minute=0, price=102.5, vwap=100.0, atr=2.0),
+    )
+
+    assert candidate is not None
+    assert "timing_call_debit_extended_above_vwap_atr_warning" in candidate.reason_codes
+
+
 def test_call_debit_spread_prefers_best_reward_risk_within_dynamic_budget():
     score = score_strategy_setup(
         StrategyScoreInput(
@@ -149,6 +253,7 @@ def test_call_debit_spread_prefers_best_reward_risk_within_dynamic_budget():
             bid_ask_pct_of_mid=0.08,
             volume=100,
             open_interest=1000,
+            breakout_or_pullback_confirmed=True,
         )
     )
 
@@ -161,6 +266,7 @@ def test_call_debit_spread_prefers_best_reward_risk_within_dynamic_budget():
         underlying="NVDA",
         dte=29,
         score=score,
+        entry_timing=_entry_timing(hour=10, minute=0),
     )
 
     assert candidate is not None
@@ -186,6 +292,35 @@ def test_put_debit_spread_candidate_has_correct_legs_and_max_loss():
     assert [leg.contract.strike for leg in candidate.legs] == [450, 448]
     assert candidate.max_profit == 150
     assert candidate.max_loss == 50
+
+
+def test_put_debit_spread_anti_chase_rejects_three_strong_bearish_candles():
+    score = _score("put_debit_spread", RegimeLabel.BEAR_TREND_HIGH_IV, iv_rank=30)
+    candles = tuple(
+        Candle(
+            symbol="QQQ",
+            timestamp=datetime(2026, 6, 4, 9, 35 + index * 5, tzinfo=NEW_YORK_TIME_ZONE),
+            open=100.0 - index,
+            high=100.5 - index,
+            low=98.0 - index,
+            close=98.0 - index,
+            volume=1000,
+        )
+        for index in range(3)
+    )
+
+    candidate = TrendParticipationEngine().generate_put_debit_spread(
+        contracts=[
+            _contract("put", 450, -0.55, 0.78, 0.82),
+            _contract("put", 448, -0.30, 0.29, 0.31),
+        ],
+        underlying="QQQ",
+        dte=21,
+        score=score,
+        entry_timing=_entry_timing(hour=10, minute=0, candles=candles),
+    )
+
+    assert candidate is None
 
 
 def test_candidate_generation_rejects_score_below_threshold():
@@ -258,6 +393,24 @@ def _contract(
         volume=volume,
         open_interest=open_interest,
         allow_missing_activity_data=allow_missing_activity_data,
+    )
+
+
+def _entry_timing(
+    *,
+    hour: int,
+    minute: int,
+    price: float | None = None,
+    vwap: float | None = None,
+    atr: float | None = None,
+    candles: tuple[Candle, ...] = (),
+) -> EntryTimingContext:
+    return EntryTimingContext(
+        timestamp=datetime(2026, 6, 4, hour, minute, tzinfo=NEW_YORK_TIME_ZONE),
+        underlying_price=price,
+        vwap=vwap,
+        atr=atr,
+        recent_candles=candles,
     )
 
 

@@ -7,6 +7,7 @@ from trading_bot.core.models import ExitPlan, OptionContract, OptionLeg, Strateg
 from trading_bot.strategies.base import StrategyEngine, candidate_quality_score
 from trading_bot.strategies.scoring import StrategyScoreResult
 from trading_bot.strategies.short_premium import CONTRACT_MULTIPLIER
+from trading_bot.strategies.timing_filters import EntryTimingContext, evaluate_entry_timing
 
 
 class TrendParticipationEngine(StrategyEngine):
@@ -17,10 +18,19 @@ class TrendParticipationEngine(StrategyEngine):
         dte: int,
         score: StrategyScoreResult,
         risk_budget_base: float | None = None,
+        entry_timing: EntryTimingContext | None = None,
     ) -> StrategyCandidate | None:
         if score.total < self.settings.strategy.min_entry_score:
             return None
         if not _trend_dte_ok(underlying, dte, self.settings):
+            return None
+        timing_decision = evaluate_entry_timing(
+            strategy_name="call_debit_spread",
+            score_reason_codes=score.reason_codes,
+            context=entry_timing,
+            settings=self.settings,
+        )
+        if not timing_decision.approved:
             return None
 
         calls = _sorted_by_strike(
@@ -57,6 +67,7 @@ class TrendParticipationEngine(StrategyEngine):
                     short_leg=short_call,
                     score=score,
                     settings=self.settings,
+                    timing_reason_codes=timing_decision.reason_codes,
                 )
                 if candidate is not None:
                     candidates.append(candidate)
@@ -75,10 +86,19 @@ class TrendParticipationEngine(StrategyEngine):
         dte: int,
         score: StrategyScoreResult,
         risk_budget_base: float | None = None,
+        entry_timing: EntryTimingContext | None = None,
     ) -> StrategyCandidate | None:
         if score.total < self.settings.strategy.min_entry_score:
             return None
         if not _trend_dte_ok(underlying, dte, self.settings):
+            return None
+        timing_decision = evaluate_entry_timing(
+            strategy_name="put_debit_spread",
+            score_reason_codes=score.reason_codes,
+            context=entry_timing,
+            settings=self.settings,
+        )
+        if not timing_decision.approved:
             return None
 
         puts = _sorted_by_strike(
@@ -115,6 +135,7 @@ class TrendParticipationEngine(StrategyEngine):
                     short_leg=short_put,
                     score=score,
                     settings=self.settings,
+                    timing_reason_codes=timing_decision.reason_codes,
                 )
                 if candidate is not None:
                     candidates.append(candidate)
@@ -135,6 +156,7 @@ def _debit_spread_candidate(
     short_leg: OptionContract | None,
     score: StrategyScoreResult,
     settings,
+    timing_reason_codes: tuple[str, ...] = (),
 ) -> StrategyCandidate | None:
     if short_leg is None:
         return None
@@ -166,7 +188,7 @@ def _debit_spread_candidate(
         max_profit=max_profit,
         max_loss=max_loss,
         expected_credit_or_debit=round(debit * CONTRACT_MULTIPLIER, 2),
-        reason_codes=score.reason_codes,
+        reason_codes=(*score.reason_codes, *timing_reason_codes),
         exit_plan=ExitPlan(
             profit_target_pct=settings.strategy.debit_spread_profit_target,
             stop_loss_pct=settings.strategy.debit_spread_stop_loss,

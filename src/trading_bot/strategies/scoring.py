@@ -4,6 +4,7 @@ from dataclasses import dataclass
 
 from trading_bot.core.models import ScoreBreakdown
 from trading_bot.regime.classifier import RegimeLabel
+from trading_bot.strategies.timing_filters import EntryTimingContext
 
 
 @dataclass(frozen=True)
@@ -22,6 +23,7 @@ class StrategyScoreInput:
     breakout_or_pullback_confirmed: bool = False
     major_event_within_24h: bool = False
     event_risk_intentionally_priced: bool = False
+    entry_timing: EntryTimingContext | None = None
 
 
 @dataclass(frozen=True)

@@ -5,6 +5,7 @@ import pytest
 
 from trading_bot.research_bot import (
     ChatGPTResearchExportWriter,
+    DEFAULT_RESEARCH_MODEL,
     OpenAIResearchClient,
     ResearchReportWriter,
     ResearchReviewer,
@@ -12,6 +13,7 @@ from trading_bot.research_bot import (
     build_chatgpt_markdown_export,
     build_research_input_from_audit_log,
 )
+from trading_bot.research_bot.chat_assistant import StrategyChatResponse
 
 
 def test_research_input_aggregates_scan_diagnostics(tmp_path):
@@ -128,6 +130,20 @@ def test_openai_research_client_reads_dotenv(tmp_path, monkeypatch):
     assert client.model == "gpt-5.5"
 
 
+def test_openai_research_client_defaults_to_latest_chat_model(tmp_path, monkeypatch):
+    monkeypatch.chdir(tmp_path)
+    monkeypatch.delenv("OPENAI_API_KEY", raising=False)
+    (tmp_path / ".env").write_text(
+        "OPENAI_API_KEY=placeholder-key\n",
+        encoding="utf-8",
+    )
+
+    client = OpenAIResearchClient.from_env()
+
+    assert client.api_key == "placeholder-key"
+    assert client.model == DEFAULT_RESEARCH_MODEL
+
+
 def test_research_export_writes_chatgpt_markdown_without_api(tmp_path):
     audit_path = tmp_path / "paper_audit.jsonl"
     audit_path.write_text(
@@ -159,6 +175,33 @@ def test_research_export_writes_chatgpt_markdown_without_api(tmp_path):
     assert "Full Compact JSON Payload" in markdown
     assert output_path.name == "chatgpt_export_2026-05-20.md"
     assert "Trading Bot Research Export" in output_path.read_text(encoding="utf-8")
+
+
+def test_strategy_chat_response_requires_research_only_json():
+    response = StrategyChatResponse.from_dict(
+        {
+            "research_only": True,
+            "assistant_reply": "Use a cool-down window before the first entry.",
+            "summary": "The first entry was early.",
+            "needs_human_approval": True,
+            "codex_task": "Add an opening cool-down filter.",
+            "proposed_changes": [
+                {
+                    "title": "Add opening cool-down",
+                    "rationale": "Avoid chasing the open.",
+                    "files": ["src/trading_bot/strategies/trend_participation.py"],
+                    "validation": ["pytest tests/unit/test_ui_server.py"],
+                    "risk_impact": "Fewer false positives.",
+                }
+            ],
+            "follow_up_questions": ["Should this also apply to QQQ?"],
+            "confidence": 0.8,
+        }
+    )
+
+    assert response.research_only is True
+    assert response.proposed_changes[0].title == "Add opening cool-down"
+    assert response.codex_task.startswith("Add an opening cool-down")
 
 
 def test_research_input_filters_by_new_york_calendar_day(tmp_path):

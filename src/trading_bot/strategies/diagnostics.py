@@ -13,6 +13,7 @@ from trading_bot.data.tastytrade_source import TastytradeMarketDataDiagnostics
 from trading_bot.regime.classifier import RegimeLabel
 from trading_bot.strategies.base import blocking_liquidity_warnings, contract_liquidity_warnings
 from trading_bot.strategies.scoring import StrategyScoreInput, score_strategy_setup
+from trading_bot.strategies.timing_filters import evaluate_entry_timing
 
 
 def build_scan_diagnostics(
@@ -88,6 +89,7 @@ def _strategy_diagnostics(
         dte=dte,
         score_total=score.total,
         score_reason_codes=score.reason_codes,
+        score_input=score_input,
         candidate=candidate,
     )
 
@@ -117,6 +119,7 @@ def _candidate_block_reasons(
     dte: int,
     score_total: float,
     score_reason_codes: tuple[str, ...],
+    score_input: StrategyScoreInput,
     candidate: StrategyCandidate | None,
 ) -> tuple[str, ...]:
     if candidate is not None:
@@ -127,6 +130,14 @@ def _candidate_block_reasons(
         reasons.append("score_below_min_entry_score")
     if "short_premium_blocked_crash_risk_off" in score_reason_codes:
         reasons.append("short_premium_blocked_crash_risk_off")
+    timing_decision = evaluate_entry_timing(
+        strategy_name=strategy_name,
+        score_reason_codes=score_reason_codes,
+        context=score_input.entry_timing,
+        settings=settings,
+    )
+    if not timing_decision.approved:
+        reasons.extend(timing_decision.reason_codes)
     if not eligible_contracts and contracts:
         reasons.append("all_contracts_failed_liquidity_filters")
     if not contracts:
