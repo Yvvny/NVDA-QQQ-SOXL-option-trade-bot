@@ -150,9 +150,9 @@ def test_spec_gate_allows_experimental_range_low_iv_call_debit_in_paper_mode():
         ),
         dte=29,
         entry_score=66,
-        max_profit=170,
-        max_loss=130,
-        expected_credit_or_debit=130,
+        max_profit=180,
+        max_loss=120,
+        expected_credit_or_debit=120,
         reason_codes=("regime_fit_reduced",),
         exit_plan=ExitPlan(profit_target_pct=0.75, stop_loss_pct=0.45),
     )

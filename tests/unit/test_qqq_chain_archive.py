@@ -1,5 +1,4 @@
 from datetime import UTC, date, datetime
-from pathlib import Path
 
 from trading_bot.core.enums import OptionType
 from trading_bot.core.models import OptionContract, UnderlyingQuote

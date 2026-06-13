@@ -3,6 +3,7 @@ from datetime import UTC, datetime
 from trading_bot.core.models import Candle
 from trading_bot.indicators import ema, realized_volatility, rsi, vwap
 from trading_bot.regime import MarketRegimeInput, RegimeClassifier, RegimeLabel
+from trading_bot.strategies.scoring import StrategyScoreInput, score_strategy_setup
 
 
 def test_ema_seeds_with_sma_then_smooths():
@@ -84,6 +85,83 @@ def test_regime_classifier_detects_crash_risk_off():
 
     assert decision.label == RegimeLabel.CRASH_RISK_OFF
     assert "crash_risk_conditions" in decision.reason_codes
+
+
+def test_regime_classifier_returns_unknown_when_intraday_confirmation_is_missing():
+    decision = RegimeClassifier().classify(
+        MarketRegimeInput(
+            qqq_close=510,
+            qqq_ema20=500,
+            qqq_ema50=480,
+            qqq_return_5d=0.02,
+            qqq_return_20d=0.06,
+            vix_level=16,
+            require_intraday_confirmation=True,
+        )
+    )
+
+    assert decision.label == RegimeLabel.UNKNOWN
+    assert "unknown_missing_intraday_confirmation" in decision.reason_codes
+
+
+def test_regime_classifier_detects_unstable_chop_from_vwap_crosses():
+    decision = RegimeClassifier().classify(
+        MarketRegimeInput(
+            qqq_close=510,
+            qqq_ema20=500,
+            qqq_ema50=480,
+            spy_close=520,
+            spy_ema20=510,
+            spy_ema50=500,
+            qqq_return_5d=0.02,
+            qqq_return_20d=0.06,
+            target_close=120,
+            qqq_vwap=509,
+            target_vwap=119,
+            qqq_vwap_cross_count=3,
+            vix_level=16,
+            iv_rank=25,
+            require_intraday_confirmation=True,
+        )
+    )
+
+    assert decision.label == RegimeLabel.UNSTABLE_CHOP
+    assert "unstable_chop_conditions" in decision.reason_codes
+
+
+def test_regime_classifier_marks_preservation_risk_mode():
+    decision = RegimeClassifier().classify(
+        MarketRegimeInput(
+            qqq_close=510,
+            qqq_ema20=500,
+            qqq_ema50=480,
+            spy_close=520,
+            spy_ema20=510,
+            spy_ema50=500,
+            qqq_return_5d=0.02,
+            qqq_return_20d=0.06,
+            vix_level=16,
+            iv_rank=25,
+            current_equity=1705.5,
+            starting_equity=2000,
+            total_open_max_loss=507.5,
+        )
+    )
+
+    assert "risk_mode_preservation_drawdown" in decision.reason_codes
+    assert "risk_mode_preservation_open_risk" in decision.reason_codes
+
+
+def test_unknown_regime_gets_hard_block_score_reason():
+    score = score_strategy_setup(
+        StrategyScoreInput(
+            strategy_name="put_credit_spread",
+            regime_label=RegimeLabel.UNKNOWN,
+        )
+    )
+
+    assert score.breakdown.regime_fit == 0
+    assert "regime_hard_block_unknown" in score.reason_codes
 
 
 def _candle(high: float, low: float, close: float, volume: int) -> Candle:

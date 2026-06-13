@@ -3,6 +3,7 @@ from __future__ import annotations
 from trading_bot.config.settings import BotSettings, load_settings
 from trading_bot.core.enums import OptionAction, OptionType, OrderType
 from trading_bot.core.models import OptionLeg, RiskDecision, StrategyCandidate
+from trading_bot.risk.budget import build_risk_budget_snapshot
 from trading_bot.risk.portfolio import PortfolioState
 
 REASON_APPROVED = "approved"
@@ -18,6 +19,7 @@ REASON_UNDEFINED_RISK_FORBIDDEN = "undefined_risk_forbidden"
 REASON_PER_TRADE_MAX_LOSS_EXCEEDED = "per_trade_max_loss_exceeded"
 REASON_SOXL_MAX_LOSS_EXCEEDED = "soxl_per_trade_max_loss_exceeded"
 REASON_TOTAL_OPEN_MAX_LOSS_EXCEEDED = "total_open_max_loss_exceeded"
+REASON_AVAILABLE_CASH_BUFFER_EXCEEDED = "available_cash_buffer_exceeded"
 REASON_DAILY_LOSS_LIMIT_EXCEEDED = "daily_loss_limit_exceeded"
 REASON_WEEKLY_LOSS_LIMIT_EXCEEDED = "weekly_loss_limit_exceeded"
 REASON_CONSECUTIVE_LOSS_LIMIT_EXCEEDED = "max_consecutive_losses_exceeded"
@@ -103,11 +105,12 @@ class RiskEngine:
         reason_codes: list[str],
         total_max_loss: float,
     ) -> None:
-        per_trade_limit = self.settings.risk.per_trade_max_loss_cap(
-            risk_budget_base=portfolio_state.available_cash,
+        budget = build_risk_budget_snapshot(
+            settings=self.settings,
+            portfolio_state=portfolio_state,
             entry_score=candidate.entry_score,
         )
-        if total_max_loss > per_trade_limit:
+        if total_max_loss > budget.configured_per_trade_max_loss_cap:
             reason_codes.append(REASON_PER_TRADE_MAX_LOSS_EXCEEDED)
 
         if (
@@ -116,12 +119,11 @@ class RiskEngine:
         ):
             reason_codes.append(REASON_SOXL_MAX_LOSS_EXCEEDED)
 
-        max_total_open_loss = (
-            portfolio_state.available_cash * self.settings.risk.total_open_max_loss_pct
-        )
-        projected_open_loss = portfolio_state.total_open_max_loss + total_max_loss
-        if projected_open_loss > max_total_open_loss:
+        if total_max_loss > budget.remaining_total_risk_budget:
             reason_codes.append(REASON_TOTAL_OPEN_MAX_LOSS_EXCEEDED)
+
+        if total_max_loss > budget.remaining_cash_capacity:
+            reason_codes.append(REASON_AVAILABLE_CASH_BUFFER_EXCEEDED)
 
     def _evaluate_portfolio_limits(
         self,

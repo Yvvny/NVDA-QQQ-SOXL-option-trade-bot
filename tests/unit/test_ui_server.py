@@ -1,7 +1,7 @@
 import base64
+import http.cookiejar
 import json
 import threading
-import http.cookiejar
 import urllib.error
 import urllib.request
 from types import SimpleNamespace
@@ -97,7 +97,9 @@ def test_ui_server_requires_basic_auth_when_configured(monkeypatch):
         else:  # pragma: no cover - defensive branch for clearer test failure.
             raise AssertionError("Expected unauthenticated request to be rejected.")
 
-        opener = urllib.request.build_opener(urllib.request.HTTPCookieProcessor(http.cookiejar.CookieJar()))
+        opener = urllib.request.build_opener(
+            urllib.request.HTTPCookieProcessor(http.cookiejar.CookieJar())
+        )
         login_request = urllib.request.Request(
             f"{base_url}/api/login",
             data=json.dumps({"username": "admin", "password": "secret"}).encode("utf-8"),
@@ -140,7 +142,10 @@ def test_ui_server_assistant_endpoint_returns_codex_ready_response(monkeypatch, 
         assistant_reply="Use a cool-down window before the first NVDA trend entry.",
         summary="The first entry looked early and should be delayed.",
         needs_human_approval=True,
-        codex_task="Add an opening cool-down filter for NVDA trend entries and validate with paper replay.",
+        codex_task=(
+            "Add an opening cool-down filter for NVDA trend entries and "
+            "validate with paper replay."
+        ),
         proposed_changes=(
             StrategyChangeProposal(
                 title="Add opening cool-down",
@@ -388,6 +393,76 @@ def test_performance_range_and_ledger_filters(monkeypatch):
     ]
     filtered_ledger = server._filter_ledger_entries(entries, "spec_rejected")
     assert [entry["event_type"] for entry in filtered_ledger] == ["paper_candidate_spec_rejected"]
+
+
+def test_paper_performance_all_range_keeps_full_account_history():
+    from trading_bot.api.server import _paper_performance_payload
+    from trading_bot.paper import PaperAccountState
+
+    state = PaperAccountState(
+        starting_equity=2000.0,
+        created_at="2026-05-01T09:30:00-04:00",
+        updated_at="2026-06-03T12:00:00-04:00",
+    )
+    logs = [
+        {
+            "event_type": "paper_cycle",
+            "logged_at": f"2026-05-{day:02d}T12:00:00-04:00",
+            "result": {
+                "summary": {
+                    "equity": 2000.0 + day,
+                    "total_pnl": float(day),
+                    "open_positions": 1,
+                }
+            },
+        }
+        for day in range(1, 31)
+    ]
+
+    performance = _paper_performance_payload(logs, state, range_key="all")
+
+    assert len(performance["points"]) == 31
+    assert performance["points"][0]["equity"] == 2000.0
+    assert performance["points"][-1]["equity"] == 2030.0
+    assert performance["range_label"].endswith("All")
+
+
+def test_paper_performance_log_reader_is_not_limited_to_recent_400(tmp_path, monkeypatch):
+    from trading_bot.api import server
+
+    state_path = tmp_path / "paper_account.json"
+    audit_path = tmp_path / "paper_audit.jsonl"
+    monkeypatch.setattr(server, "DEFAULT_PAPER_STATE_PATH", str(state_path))
+    records = []
+    for index in range(450):
+        records.append(
+            {
+                "event_type": "paper_cycle",
+                "logged_at": f"2026-05-01T{index // 60:02d}:{index % 60:02d}:00-04:00",
+                "result": {
+                    "state_path": str(state_path),
+                    "summary": {"equity": 2000 + index},
+                },
+            }
+        )
+    audit_path.write_text(
+        "\n".join(json.dumps(record) for record in records),
+        encoding="utf-8",
+    )
+
+    recent_logs = server._read_recent_paper_logs(audit_path, 400)
+    performance_logs = server._read_paper_performance_logs(audit_path)
+
+    assert len(recent_logs) == 400
+    assert len(performance_logs) == 450
+    assert performance_logs[0]["result"]["summary"]["equity"] == 2000
+
+
+def test_account_chart_uses_time_scaled_x_axis_and_hides_fallback():
+    from trading_bot.api import server
+
+    assert "Date.parse(point.time" in server._HTML
+    assert ".chart-fallback[hidden]" in server._HTML
 
 
 def test_live_equity_history_is_persisted_and_exposed(tmp_path, monkeypatch):

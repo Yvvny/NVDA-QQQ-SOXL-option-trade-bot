@@ -1,10 +1,13 @@
+from dataclasses import replace
 from datetime import date
 
+from trading_bot.config.settings import load_settings
 from trading_bot.core.enums import OptionAction, OptionType, OrderType
 from trading_bot.core.models import ExitPlan, OptionContract, OptionLeg, StrategyCandidate
 from trading_bot.risk.engine import (
     REASON_0DTE_FORBIDDEN,
     REASON_APPROVED,
+    REASON_AVAILABLE_CASH_BUFFER_EXCEEDED,
     REASON_CONSECUTIVE_LOSS_LIMIT_EXCEEDED,
     REASON_DAILY_LOSS_LIMIT_EXCEEDED,
     REASON_EVENT_RISK_BLOCK,
@@ -125,6 +128,36 @@ def test_rejects_excessive_total_open_risk():
 
     assert decision.approved is False
     assert REASON_TOTAL_OPEN_MAX_LOSS_EXCEEDED in decision.reason_codes
+
+
+def test_existing_open_max_loss_reduces_new_trade_capacity():
+    portfolio = PortfolioState(
+        account_equity=1705.5,
+        risk_budget_base=1198.0,
+        open_positions=(
+            OpenPosition("NVDA", "call_debit_spread", 327.5),
+            OpenPosition("NVDA", "call_debit_spread", 180.0),
+        ),
+    )
+
+    decision = RiskEngine().evaluate(_candidate(max_loss=100, entry_score=66), portfolio)
+
+    assert decision.approved is False
+    assert REASON_TOTAL_OPEN_MAX_LOSS_EXCEEDED in decision.reason_codes
+
+
+def test_available_cash_buffer_can_veto_new_trade():
+    settings = load_settings(env={})
+    settings = replace(
+        settings,
+        risk=replace(settings.risk, min_account_cash_buffer_pct=0.95),
+    )
+    portfolio = PortfolioState(account_equity=2000, risk_budget_base=1000)
+
+    decision = RiskEngine(settings).evaluate(_candidate(max_loss=60, entry_score=85), portfolio)
+
+    assert decision.approved is False
+    assert REASON_AVAILABLE_CASH_BUFFER_EXCEEDED in decision.reason_codes
 
 
 def test_rejects_kill_switch_state():

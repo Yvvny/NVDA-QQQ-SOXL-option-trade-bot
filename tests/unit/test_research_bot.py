@@ -4,8 +4,8 @@ from datetime import date
 import pytest
 
 from trading_bot.research_bot import (
-    ChatGPTResearchExportWriter,
     DEFAULT_RESEARCH_MODEL,
+    ChatGPTResearchExportWriter,
     OpenAIResearchClient,
     ResearchReportWriter,
     ResearchReviewer,

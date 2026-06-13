@@ -7,12 +7,11 @@ from datetime import datetime
 from typing import Protocol
 
 from trading_bot.config.settings import BotSettings, load_settings
-from trading_bot.core.time_utils import now_new_york
 from trading_bot.core.models import OptionContract, UnderlyingQuote
+from trading_bot.core.time_utils import now_new_york
 from trading_bot.strategies.base import (
     bid_ask_pct_of_mid,
     blocking_liquidity_warnings,
-    contract_liquidity_warnings,
 )
 
 

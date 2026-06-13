@@ -7,6 +7,10 @@ from trading_bot.core.enums import OptionType
 from trading_bot.core.models import StrategyCandidate
 from trading_bot.regime.classifier import RegimeLabel
 from trading_bot.strategies.base import bid_ask_pct_of_mid
+from trading_bot.strategies.reward_risk import (
+    NON_BLOCKING_REWARD_RISK_REASONS,
+    planned_reward_risk_reasons,
+)
 
 STRICT_MIN_SCORE = 60.0
 STRICT_MAX_BID_ASK_PCT_OF_MID = 0.12
@@ -86,7 +90,7 @@ def validate_candidate_against_strategy_spec(
     _validate_dte_rules(candidate, regime_label, reasons, warnings)
     _validate_delta_rules(candidate, settings, reasons)
     _validate_liquidity_rules(candidate, reasons, warnings)
-    _validate_credit_or_debit_rules(candidate, settings, reasons)
+    _validate_credit_or_debit_rules(candidate, settings, reasons, warnings)
     _validate_small_account_risk(candidate, underlying, risk_budget_base, settings, reasons)
 
     return SpecComplianceDecision(
@@ -224,6 +228,7 @@ def _validate_credit_or_debit_rules(
     candidate: StrategyCandidate,
     settings: BotSettings,
     reasons: list[str],
+    warnings: list[str],
 ) -> None:
     strategy = candidate.strategy_name
     if strategy in {"put_credit_spread", "call_credit_spread"}:
@@ -245,6 +250,12 @@ def _validate_credit_or_debit_rules(
             reasons.append("spec_debit_spread_missing_reward_risk")
         elif candidate.max_profit / candidate.max_loss < 1.2:
             reasons.append("spec_debit_spread_reward_risk_below_1_2")
+
+    for reason in planned_reward_risk_reasons(candidate, settings):
+        if reason in NON_BLOCKING_REWARD_RISK_REASONS:
+            warnings.append(f"spec_{reason}")
+        else:
+            reasons.append(f"spec_{reason}")
 
 
 def _validate_small_account_risk(

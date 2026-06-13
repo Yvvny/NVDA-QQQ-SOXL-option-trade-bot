@@ -1,10 +1,11 @@
 from __future__ import annotations
 
 import json
+from collections.abc import Sequence
 from dataclasses import asdict, dataclass, replace
 from datetime import datetime
 from enum import Enum
-from typing import Any, Protocol, Sequence
+from typing import Any, Protocol
 
 from trading_bot.core.time_utils import now_new_york
 from trading_bot.research_bot.openai_client import DEFAULT_RESEARCH_MODEL, OpenAIResearchClient
@@ -144,7 +145,8 @@ def build_strategy_chat_prompt(
         f"Assistant model: {model}\n"
         f"Conversation mode: {mode}\n\n"
         f"Context JSON:\n{json.dumps(_jsonable(context), ensure_ascii=False, sort_keys=True)}\n\n"
-        f"Conversation JSON:\n{json.dumps(conversation_payload, ensure_ascii=False, sort_keys=True)}\n"
+        "Conversation JSON:\n"
+        f"{json.dumps(conversation_payload, ensure_ascii=False, sort_keys=True)}\n"
     )
 
 

@@ -2,16 +2,16 @@ from __future__ import annotations
 
 # ruff: noqa: E501
 import base64
-from collections import Counter
 import hmac
 import json
 import os
-from hashlib import sha256
-from http.cookies import SimpleCookie
+from collections import Counter
 from dataclasses import asdict, dataclass, is_dataclass
 from datetime import UTC, date, datetime, timedelta
 from enum import Enum
+from hashlib import sha256
 from http import HTTPStatus
+from http.cookies import SimpleCookie
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 from pathlib import Path
 from typing import Any
@@ -462,7 +462,7 @@ def _session_cookie_value(credentials: tuple[str, str]) -> str:
         username.encode("utf-8"),
         sha256,
     ).hexdigest()
-    payload = f"{username}:{signature}".encode("utf-8")
+    payload = f"{username}:{signature}".encode()
     return base64.urlsafe_b64encode(payload).decode("ascii")
 
 
@@ -543,8 +543,9 @@ def _paper_account_view_payload(
     summary = state.to_summary()
     runtime = _paper_runtime_payload()
     paper_logs = _read_recent_paper_logs(DEFAULT_PAPER_AUDIT_LOG_PATH, 400)
+    performance_logs = _read_paper_performance_logs(DEFAULT_PAPER_AUDIT_LOG_PATH)
     analytics = _paper_analytics_payload(paper_logs, summary)
-    performance = _paper_performance_payload(paper_logs, state, range_key=range_key)
+    performance = _paper_performance_payload(performance_logs, state, range_key=range_key)
     ledger = _filter_ledger_entries(_paper_ledger_payload(paper_logs), ledger_filter)
     return {
         "account_type": "paper",
@@ -632,7 +633,6 @@ def _live_account_view_payload(
     snapshot = fetch_tastytrade_account_snapshot()
     balances = snapshot.balances or {}
     bot_metadata = _bot_position_metadata_index()
-    equity = balances.get("net_liquidating_value")
     _append_live_equity_snapshot(snapshot)
     performance = _live_performance_payload(snapshot, range_key=range_key)
     ledger = _filter_ledger_entries(_live_ledger_payload(), ledger_filter)
@@ -942,8 +942,19 @@ def _read_recent_jsonl(path: str | Path, limit: int) -> list[dict[str, Any]]:
     if not audit_path.exists():
         return []
     lines = audit_path.read_text(encoding="utf-8").splitlines()
+    return _parse_jsonl_lines(lines[-limit:])
+
+
+def _read_all_jsonl(path: str | Path) -> list[dict[str, Any]]:
+    audit_path = Path(path)
+    if not audit_path.exists():
+        return []
+    return _parse_jsonl_lines(audit_path.read_text(encoding="utf-8").splitlines())
+
+
+def _parse_jsonl_lines(lines: list[str]) -> list[dict[str, Any]]:
     records: list[dict[str, Any]] = []
-    for line in lines[-limit:]:
+    for line in lines:
         try:
             payload = json.loads(line)
         except json.JSONDecodeError:
@@ -956,7 +967,18 @@ def _read_recent_jsonl(path: str | Path, limit: int) -> list[dict[str, Any]]:
 
 
 def _read_recent_paper_logs(path: str | Path, limit: int) -> list[dict[str, Any]]:
-    records = _read_recent_jsonl(path, 1000)
+    return _filter_paper_logs_for_current_state(_read_recent_jsonl(path, 1000), limit=limit)
+
+
+def _read_paper_performance_logs(path: str | Path) -> list[dict[str, Any]]:
+    return _filter_paper_logs_for_current_state(_read_all_jsonl(path), limit=None)
+
+
+def _filter_paper_logs_for_current_state(
+    records: list[dict[str, Any]],
+    *,
+    limit: int | None,
+) -> list[dict[str, Any]]:
     relevant: list[dict[str, Any]] = []
     pending: list[dict[str, Any]] = []
     for record in records:
@@ -968,7 +990,7 @@ def _read_recent_paper_logs(path: str | Path, limit: int) -> list[dict[str, Any]
         if _same_state_path(state_path, DEFAULT_PAPER_STATE_PATH):
             relevant.extend(pending)
         pending = []
-    return relevant[-limit:]
+    return relevant if limit is None else relevant[-limit:]
 
 
 def _paper_performance_payload(
@@ -1027,7 +1049,7 @@ def _paper_performance_payload(
         headline_change = round(headline_value - starting_value, 2)
         if starting_value:
             headline_change_pct = round((headline_change / starting_value) * 100, 2)
-    filtered_points = _filter_performance_points(points[-240:], range_key)
+    filtered_points = _filter_performance_points(points, range_key)
     if filtered_points:
         period_starting_value = filtered_points[0]["equity"]
         period_ending_value = filtered_points[-1]["equity"]
@@ -1046,8 +1068,8 @@ def _paper_performance_payload(
 
 
 def _live_performance_payload(snapshot, *, range_key: str = "all") -> dict[str, Any]:
-    history = _read_live_equity_history(DEFAULT_LIVE_EQUITY_HISTORY_PATH, limit=1000)
-    points = _filter_performance_points(history[-500:], range_key)
+    history = _read_live_equity_history(DEFAULT_LIVE_EQUITY_HISTORY_PATH, limit=5000)
+    points = _filter_performance_points(history, range_key)
     if not points and snapshot.balances and snapshot.balances.get("net_liquidating_value") is not None:
         points = [
             {
@@ -2111,6 +2133,9 @@ _HTML = """<!doctype html>
       align-items: center;
       justify-content: center;
       color: var(--muted);
+    }
+    .chart-fallback[hidden] {
+      display: none;
     }
     .account-summary {
       display: grid;
@@ -3258,11 +3283,21 @@ _HTML = """<!doctype html>
       const values = numericPoints.map(point => Number(point.equity));
       const minValue = Math.min(...values);
       const maxValue = Math.max(...values);
-      const range = Math.max(1, maxValue - minValue);
+      const valueRange = maxValue - minValue;
+      const range = Math.max(1, valueRange);
+      const timestamps = numericPoints.map(point => Date.parse(point.time || ""));
+      const validTimestamps = timestamps.filter(value => Number.isFinite(value));
+      const minTime = validTimestamps.length ? Math.min(...validTimestamps) : null;
+      const maxTime = validTimestamps.length ? Math.max(...validTimestamps) : null;
+      const timeRange = minTime === null || maxTime === null ? 0 : maxTime - minTime;
       const xStep = numericPoints.length === 1 ? 0 : (width - paddingX * 2) / (numericPoints.length - 1);
       const coords = numericPoints.map((point, index) => {
-        const x = paddingX + index * xStep;
-        const normalized = (Number(point.equity) - minValue) / range;
+        const time = timestamps[index];
+        const timeRatio = Number.isFinite(time) && timeRange > 0
+          ? (time - minTime) / timeRange
+          : (numericPoints.length === 1 ? 0 : index / (numericPoints.length - 1));
+        const x = paddingX + Math.max(0, Math.min(1, timeRatio)) * (width - paddingX * 2);
+        const normalized = valueRange === 0 ? 0.5 : (Number(point.equity) - minValue) / range;
         const y = height - paddingY - normalized * (height - paddingY * 2);
         return { x, y, point };
       });

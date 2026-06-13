@@ -53,12 +53,14 @@ def evaluate_entry_timing(
             reason_codes=tuple(reason_codes),
         )
 
-    if _in_opening_cooldown(
+    if context.timestamp is None:
+        reason_codes.append("timing_timestamp_missing")
+    elif _in_opening_cooldown(
         context.timestamp,
         cooldown_minutes=settings.strategy.debit_spread_opening_cooldown_minutes,
     ):
         reason_codes.append("timing_opening_cooldown")
-    elif context.timestamp is not None:
+    else:
         reason_codes.append("timing_opening_cooldown_clear")
 
     reason_codes.extend(
@@ -227,13 +229,10 @@ _CLEAR_REASONS = frozenset(
     {
         "timing_not_required",
         "timing_price_action_confirmed",
-        "timing_context_missing",
         "timing_opening_cooldown_clear",
-        "timing_anti_chase_price_data_missing",
         "timing_anti_chase_price_clear",
         "timing_call_debit_extended_above_vwap_atr_warning",
         "timing_put_debit_extended_below_vwap_atr_warning",
-        "timing_anti_chase_candle_data_missing",
         "timing_anti_chase_candles_clear",
     }
 )

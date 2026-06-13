@@ -2,12 +2,11 @@ from __future__ import annotations
 
 import hashlib
 import json
-from dataclasses import asdict, dataclass
+from dataclasses import dataclass
 from pathlib import Path
 from typing import Any
 
 from trading_bot.data.tastytrade_source import TastytradeFullChainSnapshot, TastytradeSdkDataSource
-
 
 DEFAULT_QQQ_SPOOL_ROOT = Path("data_spool/qqq_option_chain")
 
@@ -144,7 +143,14 @@ def _write_chain_file(path: Path, snapshot_id: str, snapshot: TastytradeFullChai
                 "source_had_volume": contract.volume is not None,
                 "source_had_open_interest": contract.open_interest is not None,
                 "source_had_greeks": any(
-                    value is not None for value in (contract.delta, contract.gamma, contract.theta, contract.vega, contract.iv)
+                    value is not None
+                    for value in (
+                        contract.delta,
+                        contract.gamma,
+                        contract.theta,
+                        contract.vega,
+                        contract.iv,
+                    )
                 ),
             }
             handle.write(json.dumps(row, sort_keys=True) + "\n")
@@ -165,19 +171,34 @@ def _append_diagnostics_file(
         "received_contract_count": len(snapshot.option_contracts),
         "expirations_count": len(snapshot.expirations),
         "missing_bid_ask_count": sum(
-            1 for contract in snapshot.option_contracts if contract.bid is None or contract.ask is None
+            1
+            for contract in snapshot.option_contracts
+            if contract.bid is None or contract.ask is None
         ),
         "missing_greeks_count": sum(
             1
             for contract in snapshot.option_contracts
-            if all(value is None for value in (contract.delta, contract.gamma, contract.theta, contract.vega, contract.iv))
+            if all(
+                value is None
+                for value in (
+                    contract.delta,
+                    contract.gamma,
+                    contract.theta,
+                    contract.vega,
+                    contract.iv,
+                )
+            )
         ),
-        "missing_volume_count": sum(1 for contract in snapshot.option_contracts if contract.volume is None),
+        "missing_volume_count": sum(
+            1 for contract in snapshot.option_contracts if contract.volume is None
+        ),
         "missing_open_interest_count": sum(
             1 for contract in snapshot.option_contracts if contract.open_interest is None
         ),
         "market_data_incomplete": diagnostics.market_data_incomplete if diagnostics else None,
-        "subscribed_option_contracts": diagnostics.subscribed_option_contracts if diagnostics else None,
+        "subscribed_option_contracts": (
+            diagnostics.subscribed_option_contracts if diagnostics else None
+        ),
         "received_option_quotes": diagnostics.received_option_quotes if diagnostics else None,
         "received_greeks": diagnostics.received_greeks if diagnostics else None,
         "required_option_quotes": diagnostics.required_option_quotes if diagnostics else None,
@@ -200,7 +221,11 @@ def _update_manifest(
     if path.exists():
         manifest = json.loads(path.read_text(encoding="utf-8"))
     else:
-        manifest = {"date": snapshot.collected_at.date().isoformat(), "symbol": snapshot.symbol, "files": []}
+        manifest = {
+            "date": snapshot.collected_at.date().isoformat(),
+            "symbol": snapshot.symbol,
+            "files": [],
+        }
     relative_raw_path = raw_file.relative_to(root).as_posix()
     files = [item for item in manifest.get("files", []) if item.get("path") != relative_raw_path]
     files.append(

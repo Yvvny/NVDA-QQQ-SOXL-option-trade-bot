@@ -288,7 +288,9 @@ def test_exit_matrix_runs_all_documented_variants_and_changes_exit_outcomes():
     assert [variant.code for variant in report.variants] == [
         variant.code for variant in DEFAULT_EXIT_VARIANTS
     ]
-    exit_reasons = {variant.code: variant.result.trades[0].exit_reason for variant in report.variants}
+    exit_reasons = {
+        variant.code: variant.result.trades[0].exit_reason for variant in report.variants
+    }
     assert exit_reasons["E1"] == "profit_target"
     assert exit_reasons["E2"] == "profit_target"
     assert exit_reasons["E3"] == "last_snapshot"

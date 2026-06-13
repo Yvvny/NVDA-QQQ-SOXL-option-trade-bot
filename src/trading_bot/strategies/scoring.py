@@ -2,9 +2,11 @@ from __future__ import annotations
 
 from dataclasses import dataclass
 
-from trading_bot.core.models import ScoreBreakdown
+from trading_bot.core.models import Candle, ScoreBreakdown
 from trading_bot.regime.classifier import RegimeLabel
 from trading_bot.strategies.timing_filters import EntryTimingContext
+
+DEBIT_SPREAD_STRATEGIES = frozenset({"call_debit_spread", "put_debit_spread"})
 
 
 @dataclass(frozen=True)
@@ -24,6 +26,9 @@ class StrategyScoreInput:
     major_event_within_24h: bool = False
     event_risk_intentionally_priced: bool = False
     entry_timing: EntryTimingContext | None = None
+    debit_spread_pa_lookback_candles: int = 5
+    debit_spread_pa_min_body_atr_multiple: float = 0.25
+    debit_spread_pa_vwap_reclaim_tolerance_atr_multiple: float = 0.20
 
 
 @dataclass(frozen=True)
@@ -79,6 +84,12 @@ def _score_regime_fit(
         "call_credit_spread",
         "iron_condor",
     }
+    if regime_label == RegimeLabel.UNKNOWN:
+        reason_codes.append("regime_hard_block_unknown")
+        return 0.0
+    if regime_label == RegimeLabel.UNSTABLE_CHOP:
+        reason_codes.append("regime_hard_block_unstable_chop")
+        return 0.0
     if regime_label == RegimeLabel.CRASH_RISK_OFF and strategy_name in short_premium_strategies:
         reason_codes.append("short_premium_blocked_crash_risk_off")
         return 0.0
@@ -178,7 +189,23 @@ def _score_price_action(inputs: StrategyScoreInput, reason_codes: list[str]) -> 
     if bearish and inputs.price_above_vwap is False:
         score += 4.0
         reason_codes.append("price_below_vwap")
-    if inputs.breakout_or_pullback_confirmed:
+    if inputs.strategy_name in DEBIT_SPREAD_STRATEGIES:
+        confirmed, price_action_reasons = evaluate_debit_price_action_confirmation(
+            strategy_name=inputs.strategy_name,
+            context=inputs.entry_timing,
+            lookback_candles=inputs.debit_spread_pa_lookback_candles,
+            min_body_atr_multiple=inputs.debit_spread_pa_min_body_atr_multiple,
+            vwap_reclaim_tolerance_atr_multiple=(
+                inputs.debit_spread_pa_vwap_reclaim_tolerance_atr_multiple
+            ),
+        )
+        reason_codes.extend(price_action_reasons)
+        if confirmed:
+            score += 5.0
+            reason_codes.append("price_action_confirmed")
+        else:
+            reason_codes.append("price_action_unconfirmed")
+    elif inputs.breakout_or_pullback_confirmed:
         score += 5.0
         reason_codes.append("price_action_confirmed")
 
@@ -187,6 +214,89 @@ def _score_price_action(inputs: StrategyScoreInput, reason_codes: list[str]) -> 
         return 7.0
 
     return min(15.0, score)
+
+
+def evaluate_debit_price_action_confirmation(
+    *,
+    strategy_name: str,
+    context: EntryTimingContext | None,
+    lookback_candles: int,
+    min_body_atr_multiple: float,
+    vwap_reclaim_tolerance_atr_multiple: float,
+) -> tuple[bool, tuple[str, ...]]:
+    if strategy_name not in DEBIT_SPREAD_STRATEGIES:
+        return False, ()
+    if context is None or context.vwap is None or context.atr is None or context.atr <= 0:
+        return False, ("price_action_unconfirmed_insufficient_candles",)
+
+    required_previous = max(1, lookback_candles)
+    candles = context.recent_candles
+    if len(candles) < required_previous + 1:
+        return False, ("price_action_unconfirmed_insufficient_candles",)
+
+    last = candles[-1]
+    previous = candles[-(required_previous + 1) : -1]
+    body = abs(last.close - last.open)
+    if body < context.atr * min_body_atr_multiple:
+        return False, ("price_action_unconfirmed_small_body",)
+
+    if strategy_name == "call_debit_spread":
+        return _evaluate_call_debit_price_action(
+            last=last,
+            previous=previous,
+            vwap=context.vwap,
+            atr=context.atr,
+            tolerance_multiple=vwap_reclaim_tolerance_atr_multiple,
+        )
+    return _evaluate_put_debit_price_action(
+        last=last,
+        previous=previous,
+        vwap=context.vwap,
+        atr=context.atr,
+        tolerance_multiple=vwap_reclaim_tolerance_atr_multiple,
+    )
+
+
+def _evaluate_call_debit_price_action(
+    *,
+    last: Candle,
+    previous: tuple[Candle, ...],
+    vwap: float,
+    atr: float,
+    tolerance_multiple: float,
+) -> tuple[bool, tuple[str, ...]]:
+    if last.close <= vwap or last.close <= last.open:
+        return False, ("price_action_unconfirmed_wrong_vwap_side",)
+
+    if last.close > max(candle.high for candle in previous):
+        return True, ("price_action_call_breakout_confirmed",)
+
+    tolerance = atr * tolerance_multiple
+    if any(candle.low <= vwap + tolerance for candle in previous):
+        return True, ("price_action_call_vwap_reclaim_confirmed",)
+
+    return False, ("price_action_unconfirmed_no_breakout_or_reclaim",)
+
+
+def _evaluate_put_debit_price_action(
+    *,
+    last: Candle,
+    previous: tuple[Candle, ...],
+    vwap: float,
+    atr: float,
+    tolerance_multiple: float,
+) -> tuple[bool, tuple[str, ...]]:
+    if last.close >= vwap or last.close >= last.open:
+        return False, ("price_action_unconfirmed_wrong_vwap_side",)
+
+    if last.close < min(candle.low for candle in previous):
+        return True, ("price_action_put_breakdown_confirmed",)
+
+    tolerance = atr * tolerance_multiple
+    if any(candle.high >= vwap - tolerance for candle in previous):
+        return True, ("price_action_put_vwap_rejection_confirmed",)
+
+    return False, ("price_action_unconfirmed_no_breakout_or_reclaim",)
 
 
 def _score_event_risk(inputs: StrategyScoreInput, reason_codes: list[str]) -> float:

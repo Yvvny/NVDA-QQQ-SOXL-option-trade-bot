@@ -56,7 +56,8 @@ def test_underlying_quote_from_streamer_maps_bid_ask_to_last_mid():
     assert underlying_quote.symbol == "QQQ"
     assert underlying_quote.last == 510.1
     assert underlying_quote.timestamp.tzinfo is not None
-    assert underlying_quote.timestamp.isoformat().endswith("-04:00") or underlying_quote.timestamp.isoformat().endswith("-05:00")
+    timestamp = underlying_quote.timestamp.isoformat()
+    assert timestamp.endswith("-04:00") or timestamp.endswith("-05:00")
 
 
 def test_tastytrade_source_from_env_uses_explicit_mapping():

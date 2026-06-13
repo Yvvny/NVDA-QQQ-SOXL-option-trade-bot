@@ -252,7 +252,9 @@ def _parse_portfolio_state(payload: dict[str, Any] | None) -> PortfolioState | N
         weekly_realized_pnl=float(payload.get("weekly_realized_pnl", 0.0)),
         consecutive_losses=int(payload.get("consecutive_losses", 0)),
         kill_switch_active=bool(payload.get("kill_switch_active", False)),
-        open_positions=tuple(_parse_open_position(item) for item in payload.get("open_positions", ())),
+        open_positions=tuple(
+            _parse_open_position(item) for item in payload.get("open_positions", ())
+        ),
         new_trades_opened_today=int(payload.get("new_trades_opened_today", 0)),
         new_trades_opened_this_week=int(payload.get("new_trades_opened_this_week", 0)),
         available_cash=_float_or_none(payload.get("available_cash")),

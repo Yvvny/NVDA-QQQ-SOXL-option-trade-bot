@@ -9,17 +9,34 @@ from typing import Any
 from uuid import uuid4
 
 from trading_bot.config.settings import BotSettings, load_settings
-from trading_bot.core.time_utils import iso_now_new_york, now_new_york, parse_timestamp, today_new_york
 from trading_bot.core.enums import OptionAction
-from trading_bot.core.models import OptionContract, StrategyCandidate
+from trading_bot.core.models import OptionContract, RiskDecision, StrategyCandidate
+from trading_bot.core.time_utils import (
+    iso_now_new_york,
+    now_new_york,
+    parse_timestamp,
+    today_new_york,
+)
 from trading_bot.data.tastytrade_source import TastytradeSdkDataSource
 from trading_bot.execution.order_builder import OrderBuilder
-from trading_bot.risk.engine import RiskEngine
+from trading_bot.paper_rl_dataset_logger import PaperRLDatasetLogger
+from trading_bot.risk.allocation import AllocationPosition, validate_symbol_allocation
+from trading_bot.risk.budget import build_risk_budget_snapshot
+from trading_bot.risk.duplicate_correlation_gate import (
+    GateLeg,
+    GatePosition,
+    evaluate_duplicate_correlation_gate,
+)
+from trading_bot.risk.engine import REASON_APPROVED, REASON_MISSING_MAX_LOSS, RiskEngine
+from trading_bot.risk.exit_plan_quality import exit_plan_quality
+from trading_bot.risk.liquidity import validate_candidate_liquidity
+from trading_bot.risk.policy_audit import validate_pre_trade_invariants
 from trading_bot.risk.portfolio import OpenPosition, PortfolioState
 from trading_bot.risk.sizing import PositionSizer
 from trading_bot.runner import (
     DryRunBotRunner,
     _entry_timing_context_for_snapshot,
+    _mock_score_inputs,
     _regime_label_for_snapshot,
     _score_inputs_for_snapshot,
 )
@@ -34,6 +51,24 @@ DEFAULT_PAPER_POSITION_PATHS_PATH = Path("docs/reports/paper_position_paths.json
 DEFAULT_PAPER_EXIT_MATRIX_SCENARIOS_PATH = Path(
     "docs/reports/backtests/paper_exit_matrix_scenarios.json"
 )
+REASON_CAPITAL_GATE_PER_TRADE_MAX_LOSS_EXCEEDED = (
+    "capital_gate_per_trade_max_loss_exceeded"
+)
+REASON_CAPITAL_GATE_TOTAL_OPEN_MAX_LOSS_EXCEEDED = (
+    "capital_gate_total_open_max_loss_exceeded"
+)
+REASON_CAPITAL_GATE_AVAILABLE_CASH_BUFFER_EXCEEDED = (
+    "capital_gate_available_cash_buffer_exceeded"
+)
+REASON_CAPITAL_GATE_SAME_SYMBOL_POSITION_EXISTS = (
+    "capital_gate_same_symbol_position_exists"
+)
+REASON_CAPITAL_GATE_SAME_SYMBOL_SAME_DIRECTION_EXISTS = (
+    "capital_gate_same_symbol_same_direction_exists"
+)
+REASON_CAPITAL_GATE_DRAWDOWN_MODE_DAILY_TRADE_LIMIT = (
+    "capital_gate_drawdown_mode_daily_trade_limit"
+)
 
 
 @dataclass(frozen=True)
@@ -42,6 +77,8 @@ class PaperMarkSnapshot:
     dte: int
     mark_price: float
     underlying_price: float | None = None
+    vwap: float | None = None
+    price_action_confirmed: bool | None = None
     reason_code: str | None = None
 
 
@@ -73,6 +110,11 @@ class PaperPosition:
     exit_plan: dict[str, Any]
     candidate_payload: dict[str, Any] = field(default_factory=dict)
     path_snapshots: tuple[PaperMarkSnapshot, ...] = field(default_factory=tuple)
+    planned_profit_target_amount: float | None = None
+    planned_stop_loss_amount: float | None = None
+    hard_stop_loss_amount: float | None = None
+    stop_loss_basis: str | None = None
+    stop_loss_created_at: str | None = None
     last_mark_value: float | None = None
     unrealized_pnl: float = 0.0
     last_marked_at: str | None = None
@@ -167,6 +209,7 @@ class PaperTradingSimulator:
         paper_experimental: bool = False,
         position_paths_path: str | Path = DEFAULT_PAPER_POSITION_PATHS_PATH,
         exit_matrix_scenarios_path: str | Path = DEFAULT_PAPER_EXIT_MATRIX_SCENARIOS_PATH,
+        rl_dataset_path: str | Path | None = None,
     ) -> None:
         if source not in {"mock", "tastytrade"}:
             raise ValueError("source must be 'mock' or 'tastytrade'.")
@@ -187,6 +230,9 @@ class PaperTradingSimulator:
         self.state_path = Path(state_path)
         self.audit_logger = JsonlAuditLogger(audit_log_path)
         self.position_path_logger = JsonlAuditLogger(position_paths_path)
+        self.rl_dataset_logger = PaperRLDatasetLogger(
+            rl_dataset_path or "data/paper_rl_events.jsonl"
+        )
         self.starting_equity = starting_equity
         self.quote_timeout_seconds = quote_timeout_seconds
         self.max_contracts = max_contracts
@@ -211,12 +257,15 @@ class PaperTradingSimulator:
             try:
                 snapshot = self._load_snapshot(symbol)
                 underlying_last = (
-                    snapshot.underlying_quote.last if snapshot.underlying_quote is not None else None
+                    snapshot.underlying_quote.last
+                    if snapshot.underlying_quote is not None
+                    else None
                 )
                 state, close_count, closed_trades, marked_positions = _mark_and_close_positions(
                     state,
                     snapshot.option_contracts,
                     underlying_price=underlying_last,
+                    settings=self.settings,
                 )
                 for marked_position in marked_positions:
                     exit_reason = None
@@ -241,10 +290,15 @@ class PaperTradingSimulator:
                     self._persist_exit_matrix_scenario(closed_trade)
 
                 regime_label = _regime_label_for_snapshot(snapshot)
-                score_inputs = _score_inputs_for_snapshot(
-                    regime_label,
-                    snapshot.option_contracts,
-                    entry_timing=_entry_timing_context_for_snapshot(snapshot),
+                score_inputs = (
+                    _mock_score_inputs(regime_label)
+                    if self.source == "mock"
+                    else _score_inputs_for_snapshot(
+                        regime_label,
+                        snapshot.option_contracts,
+                        entry_timing=_entry_timing_context_for_snapshot(snapshot),
+                        settings=self.settings,
+                    )
                 )
                 portfolio_state = _portfolio_state_from_paper(state)
                 candidates = self.selector.generate_candidates(
@@ -314,6 +368,141 @@ class PaperTradingSimulator:
                                 }
                             )
 
+                    exit_quality = exit_plan_quality(candidate, self.settings)
+                    if (
+                        exit_quality.planned_reward_risk is not None
+                        or exit_quality.blocking_reasons
+                        or exit_quality.warning_reasons
+                    ):
+                        self._record(
+                            {
+                                "event_type": "paper_candidate_exit_plan_quality",
+                                "symbol": symbol,
+                                "candidate": candidate,
+                                "exit_plan_quality": exit_quality,
+                            }
+                        )
+                    if exit_quality.blocking_reasons:
+                        rejected += 1
+                        self._record(
+                            {
+                                "event_type": "paper_candidate_rejected",
+                                "symbol": symbol,
+                                "candidate": candidate,
+                                "risk_decision": RiskDecision(
+                                    approved=False,
+                                    reason_codes=exit_quality.blocking_reasons,
+                                    max_loss=candidate.total_max_loss(),
+                                    adjusted_size=None,
+                                ),
+                                "exit_plan_quality_gate": True,
+                                "exit_plan_quality": exit_quality,
+                            }
+                        )
+                        continue
+
+                    if self.source == "tastytrade":
+                        liquidity_decision = validate_candidate_liquidity(
+                            candidate,
+                            self.settings,
+                        )
+                        if not liquidity_decision.approved:
+                            rejected += 1
+                            self._record(
+                                {
+                                    "event_type": "paper_candidate_rejected",
+                                    "symbol": symbol,
+                                    "candidate": candidate,
+                                    "risk_decision": liquidity_decision,
+                                    "liquidity_gate": True,
+                                }
+                            )
+                            continue
+
+                        capital_decision = paper_capital_preservation_gate(
+                            candidate,
+                            state,
+                            portfolio_state,
+                            self.settings,
+                        )
+                        if not capital_decision.approved:
+                            rejected += 1
+                            self._record(
+                                {
+                                    "event_type": "paper_candidate_rejected",
+                                    "symbol": symbol,
+                                    "candidate": candidate,
+                                    "risk_decision": capital_decision,
+                                    "paper_capital_preservation_gate": True,
+                                }
+                            )
+                            continue
+
+                    allocation_decision = validate_symbol_allocation(
+                        candidate,
+                        account_equity=state.equity,
+                        open_positions=_allocation_positions_from_paper(state),
+                        settings=self.settings,
+                        preservation_mode_active=_paper_preservation_mode_active(
+                            state,
+                            self.settings,
+                        ),
+                    )
+                    if not allocation_decision.approved:
+                        rejected += 1
+                        self._record(
+                            {
+                                "event_type": "paper_candidate_rejected",
+                                "symbol": symbol,
+                                "candidate": candidate,
+                                "risk_decision": allocation_decision,
+                                "symbol_allocation_gate": True,
+                            }
+                        )
+                        continue
+
+                    duplicate_decision = evaluate_duplicate_correlation_gate(
+                        candidate,
+                        open_positions=_duplicate_gate_positions_from_paper(state),
+                        closed_positions=_duplicate_gate_closed_positions_from_paper(state),
+                        account_equity=state.equity,
+                        settings=self.settings,
+                        preservation_mode_active=_paper_preservation_mode_active(
+                            state,
+                            self.settings,
+                        ),
+                    )
+                    if not duplicate_decision.approved:
+                        rejected += 1
+                        self._record(
+                            {
+                                "event_type": "paper_candidate_rejected",
+                                "symbol": symbol,
+                                "candidate": candidate,
+                                "risk_decision": duplicate_decision,
+                                "duplicate_correlation_gate": True,
+                            }
+                        )
+                        continue
+
+                    policy_decision = validate_pre_trade_invariants(
+                        candidate,
+                        settings=self.settings,
+                        mode="paper",
+                    )
+                    if not policy_decision.approved:
+                        rejected += 1
+                        self._record(
+                            {
+                                "event_type": "paper_candidate_rejected",
+                                "symbol": symbol,
+                                "candidate": candidate,
+                                "risk_decision": policy_decision,
+                                "policy_audit": True,
+                            }
+                        )
+                        continue
+
                     decision = self.risk_engine.evaluate(candidate, portfolio_state)
                     if not decision.approved:
                         rejected += 1
@@ -328,7 +517,12 @@ class PaperTradingSimulator:
                         continue
 
                     order = self.order_builder.build(candidate)
-                    position = _paper_position_from_candidate(candidate, order.price_effect)
+                    position = _paper_position_from_candidate(
+                        candidate,
+                        order.price_effect,
+                        state=state,
+                        settings=self.settings,
+                    )
                     state = _add_open_position(state, position)
                     portfolio_state = _portfolio_state_from_paper(state)
                     opened += 1
@@ -418,6 +612,7 @@ class PaperTradingSimulator:
 
     def _record(self, event: dict[str, Any]) -> None:
         self.audit_logger.record(event)
+        self.rl_dataset_logger.record_from_paper_event(event)
 
     def _record_position_path(
         self,
@@ -455,7 +650,9 @@ class PaperTradingSimulator:
             existing = {"scenarios": []}
         scenarios = existing.get("scenarios", [])
         scenarios = [
-            item for item in scenarios if str(item.get("trade_id")) != closed_trade.position.position_id
+            item
+            for item in scenarios
+            if str(item.get("trade_id")) != closed_trade.position.position_id
         ]
         scenarios.append(scenario)
         existing["scenarios"] = scenarios
@@ -465,9 +662,205 @@ class PaperTradingSimulator:
         )
 
 
+def paper_capital_preservation_gate(
+    candidate: StrategyCandidate,
+    state: PaperAccountState,
+    portfolio_state: PortfolioState,
+    settings: BotSettings,
+) -> RiskDecision:
+    if not settings.risk.paper_capital_preservation_enabled:
+        return RiskDecision(
+            approved=True,
+            reason_codes=(REASON_APPROVED,),
+            max_loss=candidate.total_max_loss(),
+            adjusted_size=candidate.quantity,
+        )
+
+    total_max_loss = candidate.total_max_loss()
+    reason_codes: list[str] = []
+    if total_max_loss is None:
+        reason_codes.append(REASON_MISSING_MAX_LOSS)
+    else:
+        per_trade_cap = min(
+            settings.risk.paper_capital_gate_per_trade_max_loss_abs,
+            state.available_cash * settings.risk.paper_capital_gate_per_trade_max_loss_pct,
+        )
+        budget = build_risk_budget_snapshot(
+            settings=settings,
+            portfolio_state=_portfolio_state_from_paper(state),
+            entry_score=candidate.entry_score,
+            per_trade_max_loss_cap=per_trade_cap,
+            total_open_max_loss_pct=settings.risk.paper_capital_gate_total_open_max_loss_pct,
+            preservation_mode_active=True,
+        )
+        if total_max_loss > budget.configured_per_trade_max_loss_cap:
+            reason_codes.append(REASON_CAPITAL_GATE_PER_TRADE_MAX_LOSS_EXCEEDED)
+
+        if total_max_loss > budget.remaining_total_risk_budget:
+            reason_codes.append(REASON_CAPITAL_GATE_TOTAL_OPEN_MAX_LOSS_EXCEEDED)
+
+        if total_max_loss > budget.remaining_cash_capacity:
+            reason_codes.append(REASON_CAPITAL_GATE_AVAILABLE_CASH_BUFFER_EXCEEDED)
+
+    same_symbol_positions = tuple(
+        position
+        for position in state.open_positions
+        if position.underlying.upper() == candidate.underlying.upper()
+    )
+    if (
+        len(same_symbol_positions)
+        >= settings.risk.paper_capital_gate_max_same_symbol_open_positions
+    ):
+        reason_codes.append(REASON_CAPITAL_GATE_SAME_SYMBOL_POSITION_EXISTS)
+
+    candidate_direction = _strategy_direction(candidate.strategy_name)
+    same_direction_positions = tuple(
+        position
+        for position in same_symbol_positions
+        if _strategy_direction(position.strategy_name) == candidate_direction
+    )
+    if (
+        candidate_direction is not None
+        and len(same_direction_positions)
+        >= settings.risk.paper_capital_gate_max_same_symbol_same_direction_positions
+    ):
+        reason_codes.append(REASON_CAPITAL_GATE_SAME_SYMBOL_SAME_DIRECTION_EXISTS)
+
+    if (
+        state.equity < state.starting_equity
+        and portfolio_state.new_trades_today
+        >= settings.risk.paper_capital_gate_drawdown_max_new_trades_per_day
+    ):
+        reason_codes.append(REASON_CAPITAL_GATE_DRAWDOWN_MODE_DAILY_TRADE_LIMIT)
+
+    if reason_codes:
+        return RiskDecision(
+            approved=False,
+            reason_codes=_dedupe_reason_codes(reason_codes),
+            max_loss=total_max_loss,
+            adjusted_size=None,
+        )
+    return RiskDecision(
+        approved=True,
+        reason_codes=(REASON_APPROVED,),
+        max_loss=total_max_loss,
+        adjusted_size=candidate.quantity,
+    )
+
+
+def _allocation_positions_from_paper(state: PaperAccountState) -> tuple[AllocationPosition, ...]:
+    return tuple(
+        AllocationPosition(
+            symbol=position.underlying,
+            strategy_name=position.strategy_name,
+            max_loss=position.max_loss,
+            is_experiment=_paper_position_is_experiment(position),
+        )
+        for position in state.open_positions
+    )
+
+
+def _paper_preservation_mode_active(
+    state: PaperAccountState,
+    settings: BotSettings,
+) -> bool:
+    if not settings.risk.paper_capital_preservation_enabled:
+        return False
+    if state.starting_equity <= 0:
+        return True
+    drawdown_pct = max(0.0, (state.starting_equity - state.equity) / state.starting_equity)
+    if drawdown_pct >= settings.sizing.preservation_drawdown_threshold_pct:
+        return True
+    if state.equity < state.starting_equity:
+        return True
+    return (
+        state.total_open_max_loss
+        >= state.available_cash * settings.risk.paper_capital_gate_total_open_max_loss_pct
+    )
+
+
+def _paper_position_is_experiment(position: PaperPosition) -> bool:
+    reason_codes = position.candidate_payload.get("reason_codes", ())
+    if not isinstance(reason_codes, list | tuple):
+        return False
+    return any(
+        str(reason).lower()
+        in {"experiment", "experimental", "paper_experiment"}
+        or str(reason).lower().startswith("experiment_")
+        for reason in reason_codes
+    )
+
+
+def _duplicate_gate_positions_from_paper(state: PaperAccountState) -> tuple[GatePosition, ...]:
+    return tuple(_duplicate_gate_position(position) for position in state.open_positions)
+
+
+def _duplicate_gate_closed_positions_from_paper(
+    state: PaperAccountState,
+) -> tuple[GatePosition, ...]:
+    return tuple(
+        _duplicate_gate_position(
+            closed_trade.position,
+            closed_at=closed_trade.closed_at,
+            exit_reason=closed_trade.exit_reason,
+        )
+        for closed_trade in state.closed_trades
+    )
+
+
+def _duplicate_gate_position(
+    position: PaperPosition,
+    *,
+    closed_at: str | None = None,
+    exit_reason: str | None = None,
+) -> GatePosition:
+    return GatePosition(
+        symbol=position.underlying,
+        strategy_name=position.strategy_name,
+        max_loss=position.max_loss,
+        legs=tuple(
+            GateLeg(
+                action=leg.action,
+                option_type=leg.option_type,
+                strike=leg.strike,
+                expiration=leg.expiration,
+            )
+            for leg in position.legs
+        ),
+        opened_at=position.opened_at,
+        closed_at=closed_at,
+        exit_reason=exit_reason,
+    )
+
+
+def _strategy_direction(strategy_name: str) -> str | None:
+    normalized = strategy_name.lower()
+    if normalized in {"put_credit_spread", "call_debit_spread"}:
+        return "bullish"
+    if normalized in {"call_credit_spread", "put_debit_spread"}:
+        return "bearish"
+    if normalized in {"iron_condor", "calendar_spread", "diagonal_spread"}:
+        return "neutral"
+    return None
+
+
+def _dedupe_reason_codes(reason_codes: list[str]) -> tuple[str, ...]:
+    seen: set[str] = set()
+    deduped: list[str] = []
+    for reason_code in reason_codes:
+        if reason_code in seen:
+            continue
+        seen.add(reason_code)
+        deduped.append(reason_code)
+    return tuple(deduped)
+
+
 def _paper_position_from_candidate(
     candidate: StrategyCandidate,
     price_effect: str,
+    *,
+    state: PaperAccountState | None = None,
+    settings: BotSettings | None = None,
 ) -> PaperPosition:
     total_max_loss = candidate.total_max_loss()
     total_max_profit = candidate.total_max_profit()
@@ -476,6 +869,8 @@ def _paper_position_from_candidate(
         raise ValueError("Cannot paper trade a candidate without max_loss.")
     legs = tuple(_paper_leg_from_option_leg(candidate, leg) for leg in candidate.legs)
     exit_plan = asdict(candidate.exit_plan) if candidate.exit_plan is not None else {}
+    stop_fields = _normalized_stop_fields(candidate, state=state, settings=settings)
+    planned_profit_target = _planned_profit_target_amount(candidate, settings=settings)
     return PaperPosition(
         position_id=uuid4().hex,
         opened_at=iso_now_new_york(),
@@ -491,7 +886,101 @@ def _paper_position_from_candidate(
         legs=legs,
         exit_plan=exit_plan,
         candidate_payload=_candidate_payload(candidate),
+        planned_profit_target_amount=planned_profit_target,
+        planned_stop_loss_amount=stop_fields["planned_stop_loss_amount"],
+        hard_stop_loss_amount=stop_fields["hard_stop_loss_amount"],
+        stop_loss_basis=stop_fields["stop_loss_basis"],
+        stop_loss_created_at=stop_fields["stop_loss_created_at"],
     )
+
+
+def _planned_profit_target_amount(
+    candidate: StrategyCandidate,
+    *,
+    settings: BotSettings | None,
+) -> float | None:
+    if candidate.exit_plan is None or candidate.exit_plan.profit_target_pct is None:
+        return None
+    total_expected = abs(candidate.total_expected_credit_or_debit())
+    if total_expected <= 0:
+        return None
+    if candidate.strategy_name in {"put_credit_spread", "call_credit_spread", "iron_condor"}:
+        return round(total_expected * candidate.exit_plan.profit_target_pct, 2)
+    if candidate.strategy_name in {"call_debit_spread", "put_debit_spread"}:
+        if settings is None:
+            settings = load_settings()
+        total_max_profit = candidate.total_max_profit()
+        if total_max_profit is None or total_max_profit <= 0:
+            return None
+        max_profit_target = total_max_profit * candidate.exit_plan.profit_target_pct
+        debit_return_target = (
+            total_expected * settings.strategy.debit_spread_profit_target_pct_of_debit
+        )
+        return round(min(max_profit_target, debit_return_target), 2)
+    return None
+
+
+def _normalized_stop_fields(
+    candidate: StrategyCandidate,
+    *,
+    state: PaperAccountState | None,
+    settings: BotSettings | None,
+) -> dict[str, Any]:
+    if settings is None:
+        settings = load_settings()
+    total_max_loss = candidate.total_max_loss()
+    if total_max_loss is None or total_max_loss <= 0 or candidate.exit_plan is None:
+        return {
+            "planned_stop_loss_amount": None,
+            "hard_stop_loss_amount": None,
+            "stop_loss_basis": None,
+            "stop_loss_created_at": None,
+        }
+
+    multiplier = _drawdown_stop_tightening_multiplier(state, settings)
+    planned_stop: float | None = None
+    hard_stop: float | None = None
+    basis: str | None = None
+    if candidate.strategy_name in {"put_credit_spread", "call_credit_spread", "iron_condor"}:
+        credit = abs(candidate.total_expected_credit_or_debit())
+        if candidate.exit_plan.stop_loss_multiple is not None and credit > 0:
+            planned_stop = min(
+                credit * candidate.exit_plan.stop_loss_multiple,
+                total_max_loss
+                * settings.strategy.credit_spread_max_planned_loss_pct_of_max_loss,
+            )
+            hard_stop = total_max_loss * settings.strategy.credit_spread_hard_stop_pct_of_max_loss
+            basis = "credit_spread_credit_multiple_pnl_loss"
+    elif candidate.strategy_name in {"call_debit_spread", "put_debit_spread"}:
+        if candidate.exit_plan.stop_loss_pct is not None:
+            planned_stop = total_max_loss * settings.strategy.debit_spread_warning_loss_pct
+            hard_stop = total_max_loss * settings.strategy.debit_spread_hard_stop_pct_of_max_loss
+            basis = "debit_spread_warning_loss_pct_requires_thesis_invalidation"
+
+    if planned_stop is not None:
+        planned_stop = round(planned_stop * multiplier, 2)
+    if hard_stop is not None:
+        hard_stop = round(hard_stop, 2)
+    return {
+        "planned_stop_loss_amount": planned_stop,
+        "hard_stop_loss_amount": hard_stop,
+        "stop_loss_basis": basis,
+        "stop_loss_created_at": iso_now_new_york() if planned_stop is not None else None,
+    }
+
+
+def _drawdown_stop_tightening_multiplier(
+    state: PaperAccountState | None,
+    settings: BotSettings,
+) -> float:
+    if state is None or not settings.risk.drawdown_stop_tightening_enabled:
+        return 1.0
+    if state.starting_equity <= 0:
+        return 1.0
+    drawdown_pct = max(0.0, (state.starting_equity - state.equity) / state.starting_equity)
+    if drawdown_pct >= settings.risk.drawdown_stop_tightening_threshold_pct:
+        return settings.risk.drawdown_stop_tightening_multiplier
+    return 1.0
 
 
 def _paper_leg_from_option_leg(candidate: StrategyCandidate, leg) -> PaperLeg:
@@ -521,6 +1010,8 @@ def _mark_and_close_positions(
     state: PaperAccountState,
     contracts: tuple[OptionContract, ...],
     underlying_price: float | None = None,
+    settings: BotSettings | None = None,
+    checked_at: datetime | None = None,
 ) -> tuple[PaperAccountState, int, tuple[PaperClosedTrade, ...], tuple[PaperPosition, ...]]:
     contract_map = {contract.symbol: contract for contract in contracts}
     open_positions: list[PaperPosition] = []
@@ -533,7 +1024,7 @@ def _mark_and_close_positions(
     for position in state.open_positions:
         marked = _mark_position(position, contract_map, underlying_price=underlying_price)
         marked_positions.append(marked)
-        exit_reason = _exit_reason(marked)
+        exit_reason = _exit_reason(marked, settings=settings, checked_at=checked_at)
         if exit_reason is None:
             open_positions.append(marked)
             continue
@@ -601,15 +1092,47 @@ def _mark_position(
     )
 
 
-def _exit_reason(position: PaperPosition) -> str | None:
+def _exit_reason(
+    position: PaperPosition,
+    *,
+    settings: BotSettings | None = None,
+    checked_at: datetime | None = None,
+) -> str | None:
+    settings = settings or load_settings()
     plan = position.exit_plan
     pnl = position.unrealized_pnl
     max_profit = position.max_profit or 0.0
     max_loss = position.max_loss
 
+    if (
+        position.planned_profit_target_amount is not None
+        and pnl >= position.planned_profit_target_amount
+    ):
+        return "profit_target"
+
     profit_target_pct = plan.get("profit_target_pct")
     if profit_target_pct is not None and max_profit > 0 and pnl >= max_profit * profit_target_pct:
         return "profit_target"
+
+    if position.hard_stop_loss_amount is not None and pnl <= -position.hard_stop_loss_amount:
+        return "hard_stop_loss"
+
+    if (
+        position.strategy_name in {"put_credit_spread", "call_credit_spread", "iron_condor"}
+        and position.planned_stop_loss_amount is not None
+    ):
+        if _eod_tightened_stop_reached(position, settings, checked_at):
+            return "eod_tightened_stop_loss"
+        if pnl <= -position.planned_stop_loss_amount:
+            return "stop_loss_multiple"
+
+    if (
+        position.strategy_name in {"call_debit_spread", "put_debit_spread"}
+        and position.planned_stop_loss_amount is not None
+        and pnl <= -position.planned_stop_loss_amount
+        and _debit_thesis_invalidated(position, settings)
+    ):
+        return "thesis_invalidated_stop_loss"
 
     stop_loss_pct = plan.get("stop_loss_pct")
     if stop_loss_pct is not None and pnl <= -(max_loss * stop_loss_pct):
@@ -627,9 +1150,62 @@ def _exit_reason(position: PaperPosition) -> str | None:
     return None
 
 
+def _eod_tightened_stop_reached(
+    position: PaperPosition,
+    settings: BotSettings,
+    checked_at: datetime | None,
+) -> bool:
+    if position.planned_stop_loss_amount is None:
+        return False
+    now = checked_at or now_new_york()
+    if now.tzinfo is not None:
+        now = now.astimezone(now_new_york().tzinfo)
+    market_close_minutes = 16 * 60
+    current_minutes = now.hour * 60 + now.minute
+    tighten_minutes = settings.strategy.credit_spread_eod_stop_tighten_minutes
+    if current_minutes < market_close_minutes - tighten_minutes:
+        return False
+    tightened_stop = (
+        position.planned_stop_loss_amount * settings.strategy.credit_spread_eod_stop_tighten_pct
+    )
+    return position.unrealized_pnl <= -tightened_stop
+
+
+def _debit_thesis_invalidated(position: PaperPosition, settings: BotSettings) -> bool:
+    snapshots_required = (
+        2 if settings.strategy.debit_spread_invalidated_stop_requires_two_snapshots else 1
+    )
+    if len(position.path_snapshots) < snapshots_required:
+        return False
+    recent = position.path_snapshots[-snapshots_required:]
+    return all(
+        _snapshot_invalidates_debit_thesis(position.strategy_name, snapshot)
+        for snapshot in recent
+    )
+
+
+def _snapshot_invalidates_debit_thesis(
+    strategy_name: str,
+    snapshot: PaperMarkSnapshot,
+) -> bool:
+    if (
+        snapshot.underlying_price is None
+        or snapshot.vwap is None
+        or snapshot.price_action_confirmed is not False
+    ):
+        return False
+    if strategy_name == "call_debit_spread":
+        return snapshot.underlying_price < snapshot.vwap
+    if strategy_name == "put_debit_spread":
+        return snapshot.underlying_price > snapshot.vwap
+    return False
+
+
 def _days_to_earliest_expiration(position: PaperPosition) -> int:
     today = today_new_york()
     expirations = [datetime.fromisoformat(leg.expiration).date() for leg in position.legs]
+    if not expirations:
+        return 999
     return min((expiration - today).days for expiration in expirations)
 
 
@@ -639,7 +1215,11 @@ def _append_mark_snapshot(
 ) -> tuple[PaperMarkSnapshot, ...]:
     if snapshots:
         last = snapshots[-1]
-        if last.date == snapshot.date and last.dte == snapshot.dte and last.mark_price == snapshot.mark_price:
+        if (
+            last.date == snapshot.date
+            and last.dte == snapshot.dte
+            and last.mark_price == snapshot.mark_price
+        ):
             return snapshots
     return (*snapshots, snapshot)
 
@@ -651,7 +1231,11 @@ def _portfolio_state_from_paper(state: PaperAccountState) -> PortfolioState:
     week_opens = 0
     for position in state.open_positions:
         opened_timestamp = parse_timestamp(position.opened_at)
-        opened_date = opened_timestamp.date() if opened_timestamp else datetime.fromisoformat(position.opened_at).date()
+        opened_date = (
+            opened_timestamp.date()
+            if opened_timestamp
+            else datetime.fromisoformat(position.opened_at).date()
+        )
         if opened_date == today:
             today_opens += 1
         if opened_date >= week_start:
@@ -678,7 +1262,11 @@ def _realized_pnl_since(state: PaperAccountState, start_date) -> float:
     total = 0.0
     for trade in state.closed_trades:
         closed_timestamp = parse_timestamp(trade.closed_at)
-        closed_date = closed_timestamp.date() if closed_timestamp else datetime.fromisoformat(trade.closed_at).date()
+        closed_date = (
+            closed_timestamp.date()
+            if closed_timestamp
+            else datetime.fromisoformat(trade.closed_at).date()
+        )
         if closed_date >= start_date:
             total += trade.realized_pnl
     return round(total, 2)
@@ -748,12 +1336,29 @@ def _position_from_dict(payload: dict[str, Any]) -> PaperPosition:
         exit_plan=dict(payload.get("exit_plan", {})),
         candidate_payload=dict(payload.get("candidate_payload", {})),
         path_snapshots=tuple(
-            item if isinstance(item, PaperMarkSnapshot) else PaperMarkSnapshot(**item)
+            item if isinstance(item, PaperMarkSnapshot) else _mark_snapshot_from_dict(item)
             for item in payload.get("path_snapshots", [])
         ),
+        planned_profit_target_amount=payload.get("planned_profit_target_amount"),
+        planned_stop_loss_amount=payload.get("planned_stop_loss_amount"),
+        hard_stop_loss_amount=payload.get("hard_stop_loss_amount"),
+        stop_loss_basis=payload.get("stop_loss_basis"),
+        stop_loss_created_at=payload.get("stop_loss_created_at"),
         last_mark_value=payload.get("last_mark_value"),
         unrealized_pnl=float(payload.get("unrealized_pnl", 0.0)),
         last_marked_at=payload.get("last_marked_at"),
+    )
+
+
+def _mark_snapshot_from_dict(payload: dict[str, Any]) -> PaperMarkSnapshot:
+    return PaperMarkSnapshot(
+        date=payload["date"],
+        dte=int(payload["dte"]),
+        mark_price=float(payload["mark_price"]),
+        underlying_price=payload.get("underlying_price"),
+        vwap=payload.get("vwap"),
+        price_action_confirmed=payload.get("price_action_confirmed"),
+        reason_code=payload.get("reason_code"),
     )
 
 

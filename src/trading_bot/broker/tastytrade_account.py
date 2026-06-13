@@ -11,6 +11,7 @@ from typing import Any
 
 from trading_bot.core.time_utils import iso_now_new_york
 
+
 class TastytradeAccountError(RuntimeError):
     pass
 

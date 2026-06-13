@@ -1,12 +1,34 @@
 import json
-from dataclasses import dataclass
+from dataclasses import dataclass, replace
 from datetime import UTC, date, datetime
 
 from trading_bot.cli import main
-from trading_bot.core.enums import OptionType
-from trading_bot.core.models import OptionContract, UnderlyingQuote
+from trading_bot.config.settings import load_settings
+from trading_bot.core.enums import OptionAction, OptionType
+from trading_bot.core.models import (
+    ExitPlan,
+    OptionContract,
+    OptionLeg,
+    StrategyCandidate,
+    UnderlyingQuote,
+)
 from trading_bot.data.tastytrade_source import TastytradeMarketSnapshot
-from trading_bot.paper import PaperTradingSimulator
+from trading_bot.paper import (
+    REASON_CAPITAL_GATE_AVAILABLE_CASH_BUFFER_EXCEEDED,
+    REASON_CAPITAL_GATE_DRAWDOWN_MODE_DAILY_TRADE_LIMIT,
+    REASON_CAPITAL_GATE_PER_TRADE_MAX_LOSS_EXCEEDED,
+    REASON_CAPITAL_GATE_SAME_SYMBOL_POSITION_EXISTS,
+    REASON_CAPITAL_GATE_SAME_SYMBOL_SAME_DIRECTION_EXISTS,
+    REASON_CAPITAL_GATE_TOTAL_OPEN_MAX_LOSS_EXCEEDED,
+    PaperAccountState,
+    PaperMarkSnapshot,
+    PaperPosition,
+    PaperTradingSimulator,
+    _exit_reason,
+    _paper_position_from_candidate,
+    paper_capital_preservation_gate,
+)
+from trading_bot.risk.portfolio import PortfolioState
 
 
 def test_paper_simulator_opens_virtual_position_and_persists_state(tmp_path):
@@ -29,7 +51,9 @@ def test_paper_simulator_opens_virtual_position_and_persists_state(tmp_path):
     assert len(state.open_positions) == 1
     assert state.to_summary()["open_positions"] == 1
     assert state.to_summary()["equity"] == 2000
-    assert state.to_summary()["available_cash"] == 1850
+    assert state.to_summary()["available_cash"] == (
+        2000 - state.to_summary()["total_open_max_loss"]
+    )
 
 
 def test_paper_status_cli_reads_virtual_state(tmp_path, capsys):
@@ -86,7 +110,13 @@ def test_paper_once_cli_writes_virtual_state(tmp_path, capsys):
 def test_strict_spec_paper_mode_records_spec_warnings(tmp_path):
     state_path = tmp_path / "paper.json"
     audit_path = tmp_path / "paper.jsonl"
+    settings = load_settings(env={})
+    settings = replace(
+        settings,
+        strategy=replace(settings.strategy, credit_spread_min_planned_reward_risk=0.30),
+    )
     simulator = PaperTradingSimulator(
+        settings=settings,
         source="mock",
         state_path=state_path,
         audit_log_path=audit_path,
@@ -100,6 +130,35 @@ def test_strict_spec_paper_mode_records_spec_warnings(tmp_path):
     assert result.strict_spec is True
     assert result.opened_positions == 1
     assert "paper_candidate_spec_warning" in audit_text
+
+
+def test_paper_mode_records_exit_plan_quality_monitor_event(tmp_path):
+    state_path = tmp_path / "paper.json"
+    audit_path = tmp_path / "paper.jsonl"
+    simulator = PaperTradingSimulator(
+        source="mock",
+        state_path=state_path,
+        audit_log_path=audit_path,
+        starting_equity=2000,
+    )
+
+    result = simulator.run_once()
+    audit_records = [
+        json.loads(line)
+        for line in audit_path.read_text(encoding="utf-8").splitlines()
+        if line.strip()
+    ]
+    exit_quality_records = [
+        record
+        for record in audit_records
+        if record.get("event_type") == "paper_candidate_exit_plan_quality"
+    ]
+
+    assert result.opened_positions == 1
+    assert exit_quality_records
+    quality = exit_quality_records[0]["exit_plan_quality"]
+    assert quality["planned_reward_risk"] is not None
+    assert "warning_reasons" in quality
 
 
 def test_paper_cli_allows_experimental_flag(tmp_path, capsys):
@@ -129,6 +188,7 @@ def test_paper_mode_records_scan_diagnostics_for_no_candidate_cycle(tmp_path):
     state_path = tmp_path / "paper.json"
     audit_path = tmp_path / "paper.jsonl"
     simulator = PaperTradingSimulator(
+        settings=_lenient_credit_test_settings(),
         source="tastytrade",
         state_path=state_path,
         audit_log_path=audit_path,
@@ -160,6 +220,7 @@ def test_paper_records_position_paths_and_persists_exit_matrix_scenarios(tmp_pat
     path_log_path = tmp_path / "paper_position_paths.jsonl"
     scenario_path = tmp_path / "paper_exit_matrix_scenarios.json"
     simulator = PaperTradingSimulator(
+        settings=_lenient_credit_test_settings(),
         source="tastytrade",
         state_path=state_path,
         audit_log_path=audit_path,
@@ -181,6 +242,314 @@ def test_paper_records_position_paths_and_persists_exit_matrix_scenarios(tmp_pat
     assert scenario_payload["scenarios"][0]["trade_id"]
     assert len(scenario_payload["scenarios"][0]["exit_snapshots"]) >= 1
     assert any("paper_position_path_snapshot" in line for line in path_lines)
+
+
+def test_paper_capital_gate_rejects_excessive_per_trade_risk():
+    decision = paper_capital_preservation_gate(
+        _paper_candidate(max_loss=101),
+        PaperAccountState(starting_equity=2000),
+        PortfolioState(account_equity=2000),
+        load_settings(env={}),
+    )
+
+    assert decision.approved is False
+    assert REASON_CAPITAL_GATE_PER_TRADE_MAX_LOSS_EXCEEDED in decision.reason_codes
+
+
+def test_paper_capital_gate_rejects_excessive_total_open_risk():
+    state = PaperAccountState(
+        starting_equity=2000,
+        open_positions=(_paper_position("SPY", "put_credit_spread", max_loss=295),),
+    )
+
+    decision = paper_capital_preservation_gate(
+        _paper_candidate(max_loss=10),
+        state,
+        PortfolioState(account_equity=2000),
+        load_settings(env={}),
+    )
+
+    assert decision.approved is False
+    assert REASON_CAPITAL_GATE_TOTAL_OPEN_MAX_LOSS_EXCEEDED in decision.reason_codes
+
+
+def test_paper_capital_gate_uses_available_cash_and_remaining_risk_budget():
+    state = PaperAccountState(
+        starting_equity=2000,
+        realized_pnl=-294.5,
+        open_positions=(
+            _paper_position("NVDA", "call_debit_spread", max_loss=327.5),
+            _paper_position("NVDA", "call_debit_spread", max_loss=180.0),
+        ),
+    )
+
+    decision = paper_capital_preservation_gate(
+        _paper_candidate(underlying="QQQ", max_loss=100),
+        state,
+        PortfolioState(account_equity=state.equity),
+        load_settings(env={}),
+    )
+
+    assert decision.approved is False
+    assert REASON_CAPITAL_GATE_TOTAL_OPEN_MAX_LOSS_EXCEEDED in decision.reason_codes
+
+
+def test_paper_capital_gate_can_veto_for_cash_buffer_capacity():
+    settings = load_settings(env={})
+    settings = replace(
+        settings,
+        risk=replace(settings.risk, min_account_cash_buffer_pct=0.99),
+    )
+
+    decision = paper_capital_preservation_gate(
+        _paper_candidate(max_loss=50),
+        PaperAccountState(starting_equity=2000),
+        PortfolioState(account_equity=2000),
+        settings,
+    )
+
+    assert decision.approved is False
+    assert REASON_CAPITAL_GATE_AVAILABLE_CASH_BUFFER_EXCEEDED in decision.reason_codes
+
+
+def test_paper_capital_gate_rejects_same_symbol_position():
+    state = PaperAccountState(
+        starting_equity=2000,
+        open_positions=(_paper_position("QQQ", "put_credit_spread", max_loss=50),),
+    )
+
+    decision = paper_capital_preservation_gate(
+        _paper_candidate(max_loss=50),
+        state,
+        PortfolioState(account_equity=2000),
+        load_settings(env={}),
+    )
+
+    assert decision.approved is False
+    assert REASON_CAPITAL_GATE_SAME_SYMBOL_POSITION_EXISTS in decision.reason_codes
+
+
+def test_paper_capital_gate_rejects_same_symbol_same_direction_when_symbol_cap_allows_more():
+    settings = load_settings(env={})
+    settings = replace(
+        settings,
+        risk=replace(
+            settings.risk,
+            paper_capital_gate_max_same_symbol_open_positions=2,
+            paper_capital_gate_max_same_symbol_same_direction_positions=1,
+        ),
+    )
+    state = PaperAccountState(
+        starting_equity=2000,
+        open_positions=(_paper_position("QQQ", "put_credit_spread", max_loss=50),),
+    )
+
+    decision = paper_capital_preservation_gate(
+        _paper_candidate(strategy_name="call_debit_spread", max_loss=50),
+        state,
+        PortfolioState(account_equity=2000),
+        settings,
+    )
+
+    assert decision.approved is False
+    assert REASON_CAPITAL_GATE_SAME_SYMBOL_SAME_DIRECTION_EXISTS in decision.reason_codes
+    assert REASON_CAPITAL_GATE_SAME_SYMBOL_POSITION_EXISTS not in decision.reason_codes
+
+
+def test_paper_capital_gate_rejects_second_trade_in_drawdown_mode():
+    state = PaperAccountState(starting_equity=2000, realized_pnl=-10)
+
+    decision = paper_capital_preservation_gate(
+        _paper_candidate(max_loss=50),
+        state,
+        PortfolioState(account_equity=1990, new_trades_today=1),
+        load_settings(env={}),
+    )
+
+    assert decision.approved is False
+    assert REASON_CAPITAL_GATE_DRAWDOWN_MODE_DAILY_TRADE_LIMIT in decision.reason_codes
+
+
+def test_credit_spread_new_position_stores_drawdown_tightened_stop_amounts():
+    settings = load_settings(env={})
+    state = PaperAccountState(starting_equity=2000, realized_pnl=-294.5)
+    candidate = _paper_candidate(max_loss=85)
+    candidate = replace(
+        candidate,
+        max_profit=15,
+        expected_credit_or_debit=15,
+        exit_plan=ExitPlan(profit_target_pct=0.5, stop_loss_multiple=2.0),
+    )
+
+    position = _paper_position_from_candidate(
+        candidate,
+        "credit",
+        state=state,
+        settings=settings,
+    )
+
+    assert position.planned_stop_loss_amount == 25.5
+    assert position.hard_stop_loss_amount == 46.75
+    assert position.stop_loss_basis == "credit_spread_credit_multiple_pnl_loss"
+
+
+def test_new_credit_spread_stores_planned_profit_target_amount():
+    candidate = replace(
+        _paper_candidate(max_loss=85),
+        max_profit=15,
+        expected_credit_or_debit=15,
+        exit_plan=ExitPlan(profit_target_pct=0.5, stop_loss_multiple=2.0),
+    )
+
+    position = _paper_position_from_candidate(
+        candidate,
+        "credit",
+        state=PaperAccountState(starting_equity=2000),
+        settings=load_settings(env={}),
+    )
+
+    assert position.planned_profit_target_amount == 7.5
+
+
+def test_new_debit_spread_caps_planned_profit_target_by_debit_return():
+    candidate = replace(
+        _paper_candidate(strategy_name="call_debit_spread", max_loss=327.5),
+        max_profit=672.5,
+        expected_credit_or_debit=327.5,
+        exit_plan=ExitPlan(profit_target_pct=0.75, stop_loss_pct=0.45),
+    )
+
+    position = _paper_position_from_candidate(
+        candidate,
+        "debit",
+        state=PaperAccountState(starting_equity=2000),
+        settings=load_settings(env={}),
+    )
+
+    assert position.planned_profit_target_amount == 196.5
+
+
+def test_paper_exit_prefers_stored_planned_profit_target_amount():
+    position = replace(
+        _paper_position("QQQ", "call_debit_spread", max_loss=180),
+        max_profit=320,
+        expected_credit_or_debit=180,
+        unrealized_pnl=109,
+        planned_profit_target_amount=108,
+        exit_plan={"profit_target_pct": 0.75, "stop_loss_pct": 0.45},
+    )
+
+    assert _exit_reason(position, settings=load_settings(env={})) == "profit_target"
+
+
+def test_credit_spread_triggers_normalized_planned_stop():
+    position = replace(
+        _paper_position("QQQ", "put_credit_spread", max_loss=85),
+        max_profit=15,
+        expected_credit_or_debit=15,
+        unrealized_pnl=-30,
+        planned_stop_loss_amount=30,
+        hard_stop_loss_amount=46.75,
+    )
+
+    assert _exit_reason(position, settings=load_settings(env={})) == "stop_loss_multiple"
+
+
+def test_credit_spread_triggers_hard_stop_before_planned_stop_reason():
+    position = replace(
+        _paper_position("QQQ", "put_credit_spread", max_loss=85),
+        max_profit=15,
+        expected_credit_or_debit=15,
+        unrealized_pnl=-46.75,
+        planned_stop_loss_amount=30,
+        hard_stop_loss_amount=46.75,
+    )
+
+    assert _exit_reason(position, settings=load_settings(env={})) == "hard_stop_loss"
+
+
+def test_credit_spread_triggers_eod_tightened_stop():
+    checked_at = datetime(2026, 6, 4, 15, 45)
+    position = replace(
+        _paper_position("QQQ", "put_credit_spread", max_loss=85),
+        max_profit=15,
+        expected_credit_or_debit=15,
+        unrealized_pnl=-24,
+        planned_stop_loss_amount=30,
+        hard_stop_loss_amount=46.75,
+    )
+
+    assert (
+        _exit_reason(position, settings=load_settings(env={}), checked_at=checked_at)
+        == "eod_tightened_stop_loss"
+    )
+
+
+def test_debit_spread_triggers_hard_stop_loss():
+    position = replace(
+        _paper_position("QQQ", "call_debit_spread", max_loss=180),
+        max_profit=320,
+        expected_credit_or_debit=180,
+        unrealized_pnl=-81,
+        planned_stop_loss_amount=63,
+        hard_stop_loss_amount=81,
+        exit_plan={"profit_target_pct": 0.75, "stop_loss_pct": 0.45},
+    )
+
+    assert _exit_reason(position, settings=load_settings(env={})) == "hard_stop_loss"
+
+
+def test_debit_warning_stop_does_not_trigger_when_market_data_missing():
+    position = replace(
+        _paper_position("QQQ", "call_debit_spread", max_loss=180),
+        max_profit=320,
+        expected_credit_or_debit=180,
+        unrealized_pnl=-63,
+        planned_stop_loss_amount=63,
+        hard_stop_loss_amount=81,
+        exit_plan={"profit_target_pct": 0.75, "stop_loss_pct": 0.45},
+        path_snapshots=(
+            PaperMarkSnapshot(date="2026-06-04", dte=21, mark_price=1.0),
+            PaperMarkSnapshot(date="2026-06-05", dte=20, mark_price=1.1),
+        ),
+    )
+
+    assert _exit_reason(position, settings=load_settings(env={})) is None
+
+
+def test_debit_warning_stop_triggers_when_thesis_invalidated_for_two_snapshots():
+    position = replace(
+        _paper_position("QQQ", "call_debit_spread", max_loss=180),
+        max_profit=320,
+        expected_credit_or_debit=180,
+        unrealized_pnl=-63,
+        planned_stop_loss_amount=63,
+        hard_stop_loss_amount=81,
+        exit_plan={"profit_target_pct": 0.75, "stop_loss_pct": 0.45},
+        path_snapshots=(
+            PaperMarkSnapshot(
+                date="2026-06-04",
+                dte=21,
+                mark_price=1.0,
+                underlying_price=99,
+                vwap=100,
+                price_action_confirmed=False,
+            ),
+            PaperMarkSnapshot(
+                date="2026-06-05",
+                dte=20,
+                mark_price=1.1,
+                underlying_price=98,
+                vwap=100,
+                price_action_confirmed=False,
+            ),
+        ),
+    )
+
+    assert (
+        _exit_reason(position, settings=load_settings(env={}))
+        == "thesis_invalidated_stop_loss"
+    )
 
 
 @dataclass(frozen=True)
@@ -214,6 +583,100 @@ class _IlliquidTastytradeDataSource:
                 ),
             ),
         )
+
+
+def _paper_candidate(
+    *,
+    strategy_name: str = "put_credit_spread",
+    underlying: str = "QQQ",
+    max_loss: float | None = 50.0,
+) -> StrategyCandidate:
+    expiration = date(2026, 6, 19)
+    return StrategyCandidate(
+        strategy_name=strategy_name,
+        underlying=underlying,
+        legs=(
+            OptionLeg(
+                contract=OptionContract(
+                    symbol=f"{underlying} {expiration.isoformat()} 450 put",
+                    underlying=underlying,
+                    expiration=expiration,
+                    strike=450,
+                    option_type=OptionType.PUT,
+                    bid=1.0,
+                    ask=1.1,
+                    mid=1.05,
+                    delta=-0.25,
+                    volume=100,
+                    open_interest=1000,
+                ),
+                action=OptionAction.SELL,
+            ),
+            OptionLeg(
+                contract=OptionContract(
+                    symbol=f"{underlying} {expiration.isoformat()} 449 put",
+                    underlying=underlying,
+                    expiration=expiration,
+                    strike=449,
+                    option_type=OptionType.PUT,
+                    bid=0.5,
+                    ask=0.6,
+                    mid=0.55,
+                    delta=-0.10,
+                    volume=100,
+                    open_interest=1000,
+                ),
+                action=OptionAction.BUY,
+            ),
+        ),
+        dte=30,
+        entry_score=75,
+        max_profit=50,
+        max_loss=max_loss,
+        expected_credit_or_debit=50,
+        reason_codes=("fixture",),
+        exit_plan=ExitPlan(profit_target_pct=0.5, stop_loss_multiple=2.5),
+    )
+
+
+def _lenient_credit_test_settings():
+    settings = load_settings(env={})
+    return replace(
+        settings,
+        strategy=replace(
+            settings.strategy,
+            min_entry_score=50,
+            credit_spread_min_planned_reward_risk=0.20,
+        ),
+        liquidity=replace(
+            settings.liquidity,
+            max_package_bid_ask_pct_of_entry=0.20,
+        ),
+        selection=replace(settings.selection, enabled=False),
+    )
+
+
+def _paper_position(
+    symbol: str,
+    strategy_name: str,
+    *,
+    max_loss: float,
+) -> PaperPosition:
+    return PaperPosition(
+        position_id=f"{symbol}-{strategy_name}",
+        opened_at="2026-06-06T10:00:00-04:00",
+        underlying=symbol,
+        strategy_name=strategy_name,
+        dte_at_entry=30,
+        entry_score=75,
+        max_profit=50,
+        max_loss=max_loss,
+        expected_credit_or_debit=50,
+        price_effect="credit",
+        entry_value=-50,
+        legs=(),
+        exit_plan={},
+    )
 
 
 class _ClosableTastytradeDataSource:

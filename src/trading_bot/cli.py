@@ -10,9 +10,9 @@ from trading_bot.api import UiServerConfig, run_ui_server
 from trading_bot.backtest import load_scenarios_from_json, run_exit_matrix
 from trading_bot.broker import fetch_tastytrade_account_snapshot
 from trading_bot.config.settings import load_settings
+from trading_bot.core.time_utils import now_new_york
 from trading_bot.data.qqq_chain_archive import DEFAULT_QQQ_SPOOL_ROOT, QqqFullChainCollector
 from trading_bot.data.tastytrade_source import TastytradeSdkDataSource
-from trading_bot.core.time_utils import now_new_york
 from trading_bot.paper import DEFAULT_PAPER_STATE_PATH, PaperTradingSimulator
 from trading_bot.research_bot import (
     ChatGPTResearchExportWriter,
@@ -300,7 +300,12 @@ def main(argv: Sequence[str] | None = None) -> int:
 
     if args.command == "collect-qqq-chain":
         now = now_new_york()
-        if now.weekday() >= 5 or (now.hour, now.minute) < (9, 30) or (now.hour, now.minute) > (16, 0):
+        outside_market_hours = (
+            now.weekday() >= 5
+            or (now.hour, now.minute) < (9, 30)
+            or (now.hour, now.minute) > (16, 0)
+        )
+        if outside_market_hours:
             print(
                 json.dumps(
                     {

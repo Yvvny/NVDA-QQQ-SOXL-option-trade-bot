@@ -16,8 +16,16 @@ def build_parser() -> argparse.ArgumentParser:
     )
     parser.add_argument("--ssh-key", required=True, help="Path to the SSH private key.")
     parser.add_argument("--remote", required=True, help="Remote in user@host form.")
-    parser.add_argument("--remote-root", required=True, help="Remote project root, for example /opt/trading-bot.")
-    parser.add_argument("--local-root", required=True, help="Local archive root, for example D:\\MarketData\\QQQ.")
+    parser.add_argument(
+        "--remote-root",
+        required=True,
+        help="Remote project root, for example /opt/trading-bot.",
+    )
+    parser.add_argument(
+        "--local-root",
+        required=True,
+        help="Local archive root, for example D:\\MarketData\\QQQ.",
+    )
     parser.add_argument(
         "--remote-spool-root",
         default="data_spool/qqq_option_chain",
@@ -26,7 +34,10 @@ def build_parser() -> argparse.ArgumentParser:
     parser.add_argument(
         "--delete-remote-after-verify",
         action="store_true",
-        help="Delete verified remote raw snapshot files after local download and checksum validation.",
+        help=(
+            "Delete verified remote raw snapshot files after local download and "
+            "checksum validation."
+        ),
     )
     return parser
 
@@ -39,7 +50,11 @@ def main(argv: list[str] | None = None) -> int:
     manifest_paths = _list_remote_manifests(args.ssh_key, args.remote, remote_spool_root)
     synced = 0
     for manifest_path in manifest_paths:
-        manifest = _read_remote_json(args.ssh_key, args.remote, f"{remote_spool_root}/{manifest_path}")
+        manifest = _read_remote_json(
+            args.ssh_key,
+            args.remote,
+            f"{remote_spool_root}/{manifest_path}",
+        )
         _write_local_manifest(local_root, manifest_path, manifest)
         for entry in manifest.get("files", []):
             relative_path = str(entry["path"])

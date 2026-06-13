@@ -10,11 +10,21 @@ risk:
   daily_loss_limit: 200
   weekly_loss_limit: 400
   max_consecutive_losses: 3
-  max_new_trades_per_day: 2
+  max_new_trades_per_day: 1
   max_new_trades_per_week: 5
   max_same_symbol_open_positions: 2
   max_same_strategy_open_positions: 3
   min_account_cash_buffer_pct: 0.25
+  drawdown_stop_tightening_enabled: true
+  drawdown_stop_tightening_threshold_pct: 0.10
+  drawdown_stop_tightening_multiplier: 0.85
+  paper_capital_preservation_enabled: true
+  paper_capital_gate_per_trade_max_loss_abs: 100
+  paper_capital_gate_per_trade_max_loss_pct: 0.05
+  paper_capital_gate_total_open_max_loss_pct: 0.12
+  paper_capital_gate_max_same_symbol_open_positions: 1
+  paper_capital_gate_max_same_symbol_same_direction_positions: 1
+  paper_capital_gate_drawdown_max_new_trades_per_day: 1
 
 forbidden:
   allow_0dte: false
@@ -24,9 +34,13 @@ forbidden:
 
 liquidity:
   max_bid_ask_pct_of_mid: 0.15
+  max_abs_bid_ask_width: 0.10
+  max_package_bid_ask_pct_of_entry: 0.15
   min_open_interest: 100
   min_volume: 10
   allow_missing_greeks: false
+  paper_liquidity_observation_mode: false
+  observation_max_contracts: 1
 
 dte:
   short_premium_min: 21
@@ -68,8 +82,9 @@ strategy:
   credit_spread_profit_target: 0.50
   iron_condor_profit_target: 0.35
   debit_spread_profit_target: 0.75
+  debit_spread_profit_target_pct_of_debit: 0.60
   calendar_profit_target: 0.25
-  credit_spread_stop_multiple: 2.5
+  credit_spread_stop_multiple: 2.0
   debit_spread_stop_loss: 0.45
   calendar_stop_loss: 0.35
   debit_spread_opening_cooldown_minutes: 20
@@ -79,15 +94,91 @@ strategy:
   debit_spread_anti_chase_candle_count: 3
   debit_spread_strong_candle_body_pct: 0.60
   debit_spread_strong_candle_min_body_atr_multiple: 0.50
+  debit_spread_pa_lookback_candles: 5
+  debit_spread_pa_min_body_atr_multiple: 0.25
+  debit_spread_pa_vwap_reclaim_tolerance_atr_multiple: 0.20
+  qqq_put_credit_spread_quality_enabled: true
+  qqq_put_credit_spread_preferred_delta_max: 0.20
+  qqq_put_credit_spread_min_atr_cushion: 1.0
+  qqq_put_credit_spread_strong_atr_cushion: 1.5
+  qqq_put_credit_spread_preferred_width: 2.0
+  qqq_put_credit_spread_preferred_credit_pct_max: 0.30
+  nvda_debit_spread_experimental_enabled: false
+  nvda_debit_spread_min_entry_score: 80
+  nvda_debit_spread_max_iv_rank: 45
+  nvda_debit_spread_min_reward_risk: 1.5
+  nvda_debit_spread_max_width: 5.0
+  debit_spread_min_reward_risk: 1.35
+  credit_spread_min_planned_reward_risk: 0.25
+  credit_spread_high_quality_override_score: 80
+  exit_plan_quality_enabled: true
+  exit_plan_quality_monitor_only: true
+  credit_spread_max_planned_loss_pct_of_max_loss: 0.60
+  credit_spread_hard_stop_pct_of_max_loss: 0.55
+  credit_spread_eod_stop_tighten_minutes: 20
+  credit_spread_eod_stop_tighten_pct: 0.80
+  debit_spread_warning_loss_pct: 0.35
+  debit_spread_hard_stop_pct_of_max_loss: 0.45
+  debit_spread_invalidated_stop_requires_two_snapshots: true
+  debit_spread_min_planned_reward_risk: 1.25
+  debit_spread_max_planned_loss_pct_of_max_loss: 0.45
 
 sizing:
-  low_score_target_risk_pct: 0.02
-  good_score_target_risk_pct: 0.10
-  high_score_target_risk_pct: 0.20
-  low_score_max_contracts: 2
-  good_score_max_contracts: 10
-  high_score_max_contracts: 20
+  low_score_target_risk_pct: 0.01
+  good_score_target_risk_pct: 0.025
+  high_score_target_risk_pct: 0.04
+  low_score_max_contracts: 1
+  good_score_max_contracts: 2
+  high_score_max_contracts: 3
   same_symbol_multiplier: 0.50
   same_strategy_multiplier: 0.75
   crowded_portfolio_threshold_pct: 0.25
   crowded_portfolio_multiplier: 0.75
+  preservation_enabled: true
+  preservation_drawdown_threshold_pct: 0.10
+  preservation_per_trade_max_loss_pct: 0.05
+  preservation_per_trade_max_loss_abs: 100
+  preservation_total_open_max_loss_pct: 0.12
+  preservation_max_contracts: 1
+  preservation_disable_scale_up: true
+  scale_up_enabled: false
+  scale_up_min_closed_trades: 20
+  scale_up_min_profit_factor: 1.20
+  scale_up_max_drawdown_pct: 0.08
+  scale_up_min_positive_expectancy_per_trade: 0.01
+  scale_up_increment_contracts: 1
+  scale_up_max_contracts_absolute: 3
+
+allocation:
+  enabled: true
+  preservation_only: true
+  qqq_preservation_max_open_risk_pct: 0.10
+  nvda_preservation_max_open_risk_pct: 0.08
+  soxl_preservation_max_open_risk_pct: 0.05
+  tech_beta_cluster_symbols: QQQ,NVDA,SOXL
+  tech_beta_cluster_max_open_risk_pct: 0.20
+  experimental_budget_pct: 0.03
+  max_active_experiments: 1
+  experimental_only_symbols: SOXL
+
+selection:
+  enabled: true
+  normal_min_opportunity_score: 70
+  preservation_min_opportunity_score: 78
+  min_top_score_gap: 8
+  lower_max_loss_tie_breaker_pct: 0.75
+
+duplicate_correlation:
+  enabled: true
+  exact_duplicate_reject: true
+  near_duplicate_reject: true
+  near_duplicate_expiry_days: 7
+  near_duplicate_min_strike_overlap_pct: 0.50
+  near_duplicate_max_loss_similarity_pct: 0.25
+  max_positions_per_symbol_direction: 1
+  max_positions_per_thesis_bucket: 1
+  max_bullish_tech_beta_positions: 1
+  max_bearish_tech_beta_positions: 1
+  stopout_cooldown_days_same_symbol_strategy: 1
+  stopout_cooldown_days_same_thesis_after_two_stopouts: 2
+  preservation_block_open_max_loss_pct: 0.20

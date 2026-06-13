@@ -9,6 +9,8 @@ from trading_bot.indicators.ema import ema
 
 
 class RegimeLabel(StrEnum):
+    UNKNOWN = "unknown"
+    UNSTABLE_CHOP = "unstable_chop"
     BULL_TREND_LOW_MID_IV = "bull_trend_low_mid_iv"
     BULL_TREND_HIGH_IV = "bull_trend_high_iv"
     RANGE_HIGH_IV = "range_high_iv"
@@ -38,6 +40,18 @@ class MarketRegimeInput:
     implied_volatility: float | None = None
     major_event_within_24h: bool = False
     stale_or_inconsistent_data: bool = False
+    require_intraday_confirmation: bool = False
+    qqq_vwap: float | None = None
+    target_close: float | None = None
+    target_vwap: float | None = None
+    qqq_intraday_slope: float | None = None
+    target_intraday_slope: float | None = None
+    volatility_expanding: bool | None = None
+    qqq_vwap_cross_count: int | None = None
+    current_equity: float | None = None
+    starting_equity: float | None = None
+    total_open_max_loss: float | None = None
+    preservation_mode_active: bool = False
 
 
 @dataclass(frozen=True)
@@ -60,10 +74,29 @@ class RegimeClassifier:
 
         if inputs.stale_or_inconsistent_data:
             return RegimeDecision(
-                label=RegimeLabel.CRASH_RISK_OFF,
+                label=RegimeLabel.UNKNOWN,
                 confidence=max(0.35, confidence),
                 reason_codes=tuple([*reason_codes, "stale_or_inconsistent_data"]),
-                preferred_strategies=("hedge_only",),
+                preferred_strategies=(),
+            )
+
+        preservation_reasons = _preservation_reason_codes(inputs)
+        reason_codes.extend(preservation_reasons)
+
+        if _is_unknown_intraday_regime(inputs):
+            return RegimeDecision(
+                label=RegimeLabel.UNKNOWN,
+                confidence=max(0.30, confidence - 0.20),
+                reason_codes=tuple([*reason_codes, "unknown_missing_intraday_confirmation"]),
+                preferred_strategies=(),
+            )
+
+        if _is_unstable_chop(inputs):
+            return RegimeDecision(
+                label=RegimeLabel.UNSTABLE_CHOP,
+                confidence=max(0.35, confidence - 0.10),
+                reason_codes=tuple([*reason_codes, "unstable_chop_conditions"]),
+                preferred_strategies=(),
             )
 
         if _is_crash_risk(inputs):
@@ -154,6 +187,66 @@ def classify_from_daily_candles(
         iv_rank=iv_rank,
     )
     return classifier.classify(inputs)
+
+
+def _is_unknown_intraday_regime(inputs: MarketRegimeInput) -> bool:
+    if not inputs.require_intraday_confirmation:
+        return False
+    required_values = (
+        inputs.qqq_close,
+        inputs.qqq_vwap,
+        inputs.target_close,
+        inputs.target_vwap,
+    )
+    return any(value is None for value in required_values)
+
+
+def _is_unstable_chop(inputs: MarketRegimeInput) -> bool:
+    if inputs.qqq_vwap_cross_count is not None and inputs.qqq_vwap_cross_count >= 3:
+        return True
+    if inputs.volatility_expanding is True and _intraday_signals_conflict(inputs):
+        return True
+    return False
+
+
+def _intraday_signals_conflict(inputs: MarketRegimeInput) -> bool:
+    if (
+        inputs.qqq_intraday_slope is not None
+        and inputs.target_intraday_slope is not None
+        and inputs.qqq_intraday_slope * inputs.target_intraday_slope < 0
+    ):
+        return True
+    if (
+        inputs.qqq_close is not None
+        and inputs.qqq_vwap is not None
+        and inputs.target_close is not None
+        and inputs.target_vwap is not None
+    ):
+        qqq_above_vwap = inputs.qqq_close > inputs.qqq_vwap
+        target_above_vwap = inputs.target_close > inputs.target_vwap
+        return qqq_above_vwap != target_above_vwap
+    return False
+
+
+def _preservation_reason_codes(inputs: MarketRegimeInput) -> list[str]:
+    reasons: list[str] = []
+    if inputs.preservation_mode_active:
+        reasons.append("risk_mode_preservation")
+    if (
+        inputs.current_equity is not None
+        and inputs.starting_equity is not None
+        and inputs.starting_equity > 0
+        and (inputs.starting_equity - inputs.current_equity) / inputs.starting_equity >= 0.10
+    ):
+        reasons.append("risk_mode_preservation_drawdown")
+    if (
+        inputs.current_equity is not None
+        and inputs.current_equity > 0
+        and inputs.total_open_max_loss is not None
+        and inputs.total_open_max_loss / inputs.current_equity >= 0.25
+    ):
+        reasons.append("risk_mode_preservation_open_risk")
+    return reasons
 
 
 def _is_crash_risk(inputs: MarketRegimeInput) -> bool:

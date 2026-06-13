@@ -1,10 +1,16 @@
 from __future__ import annotations
 
 from collections.abc import Sequence
+from dataclasses import replace
 
 from trading_bot.core.enums import OptionAction, OptionType
 from trading_bot.core.models import ExitPlan, OptionContract, OptionLeg, StrategyCandidate
+from trading_bot.risk.exit_plan_quality import exit_plan_quality_sort_key
 from trading_bot.strategies.base import StrategyEngine, candidate_quality_score
+from trading_bot.strategies.reward_risk import (
+    blocking_planned_reward_risk_reasons,
+    planned_reward_risk_reasons,
+)
 from trading_bot.strategies.scoring import StrategyScoreResult
 from trading_bot.strategies.short_premium import CONTRACT_MULTIPLIER
 from trading_bot.strategies.timing_filters import EntryTimingContext, evaluate_entry_timing
@@ -19,10 +25,19 @@ class TrendParticipationEngine(StrategyEngine):
         score: StrategyScoreResult,
         risk_budget_base: float | None = None,
         entry_timing: EntryTimingContext | None = None,
+        iv_rank: float | None = None,
     ) -> StrategyCandidate | None:
         if score.total < self.settings.strategy.min_entry_score:
             return None
         if not _trend_dte_ok(underlying, dte, self.settings):
+            return None
+        if nvda_debit_spread_pre_candidate_reasons(
+            underlying=underlying,
+            strategy_name="call_debit_spread",
+            score=score,
+            iv_rank=iv_rank,
+            settings=self.settings,
+        ):
             return None
         timing_decision = evaluate_entry_timing(
             strategy_name="call_debit_spread",
@@ -70,7 +85,17 @@ class TrendParticipationEngine(StrategyEngine):
                     timing_reason_codes=timing_decision.reason_codes,
                 )
                 if candidate is not None:
-                    candidates.append(candidate)
+                    candidate = _candidate_with_planned_reward_risk_reasons(
+                        candidate,
+                        self.settings,
+                    )
+                    if candidate is not None:
+                        candidate = _candidate_with_nvda_debit_reasons(
+                            candidate,
+                            self.settings,
+                        )
+                    if candidate is not None:
+                        candidates.append(candidate)
         return _select_preferred_candidate(
             candidates,
             underlying,
@@ -87,10 +112,19 @@ class TrendParticipationEngine(StrategyEngine):
         score: StrategyScoreResult,
         risk_budget_base: float | None = None,
         entry_timing: EntryTimingContext | None = None,
+        iv_rank: float | None = None,
     ) -> StrategyCandidate | None:
         if score.total < self.settings.strategy.min_entry_score:
             return None
         if not _trend_dte_ok(underlying, dte, self.settings):
+            return None
+        if nvda_debit_spread_pre_candidate_reasons(
+            underlying=underlying,
+            strategy_name="put_debit_spread",
+            score=score,
+            iv_rank=iv_rank,
+            settings=self.settings,
+        ):
             return None
         timing_decision = evaluate_entry_timing(
             strategy_name="put_debit_spread",
@@ -138,7 +172,17 @@ class TrendParticipationEngine(StrategyEngine):
                     timing_reason_codes=timing_decision.reason_codes,
                 )
                 if candidate is not None:
-                    candidates.append(candidate)
+                    candidate = _candidate_with_planned_reward_risk_reasons(
+                        candidate,
+                        self.settings,
+                    )
+                    if candidate is not None:
+                        candidate = _candidate_with_nvda_debit_reasons(
+                            candidate,
+                            self.settings,
+                        )
+                    if candidate is not None:
+                        candidates.append(candidate)
         return _select_preferred_candidate(
             candidates,
             underlying,
@@ -233,6 +277,7 @@ def _select_preferred_candidate(
     return max(
         pool,
         key=lambda candidate: (
+            *exit_plan_quality_sort_key(candidate, settings),
             candidate_quality_score(candidate, risk_cap),
             -(candidate.max_loss if candidate.max_loss is not None else float("inf")),
         ),
@@ -252,3 +297,93 @@ def _preferred_max_loss_cap(
     if underlying.upper() == "SOXL":
         return min(cap, settings.risk.soxl_per_trade_max_loss)
     return cap
+
+
+def nvda_debit_spread_pre_candidate_reasons(
+    *,
+    underlying: str,
+    strategy_name: str,
+    score: StrategyScoreResult,
+    iv_rank: float | None,
+    settings,
+) -> tuple[str, ...]:
+    if underlying.upper() != "NVDA" or strategy_name not in {
+        "call_debit_spread",
+        "put_debit_spread",
+    }:
+        return ()
+
+    if not settings.strategy.nvda_debit_spread_experimental_enabled:
+        return ("nvda_debit_spread_disabled_by_default",)
+
+    reasons: list[str] = []
+    if score.total < settings.strategy.nvda_debit_spread_min_entry_score:
+        reasons.append("nvda_debit_spread_score_below_80")
+    if "event_risk_penalty" in score.reason_codes:
+        reasons.append("nvda_debit_spread_event_risk_penalty")
+    if iv_rank is None:
+        reasons.append("nvda_debit_spread_iv_missing")
+    elif iv_rank > settings.strategy.nvda_debit_spread_max_iv_rank:
+        reasons.append("nvda_debit_spread_iv_too_high")
+    return tuple(reasons)
+
+
+def _candidate_with_planned_reward_risk_reasons(
+    candidate: StrategyCandidate,
+    settings,
+) -> StrategyCandidate | None:
+    if blocking_planned_reward_risk_reasons(candidate, settings):
+        return None
+    reasons = planned_reward_risk_reasons(candidate, settings)
+    if not reasons:
+        return candidate
+    return replace(candidate, reason_codes=(*candidate.reason_codes, *reasons))
+
+
+def _candidate_with_nvda_debit_reasons(
+    candidate: StrategyCandidate,
+    settings,
+) -> StrategyCandidate | None:
+    if candidate.underlying.upper() != "NVDA" or candidate.strategy_name not in {
+        "call_debit_spread",
+        "put_debit_spread",
+    }:
+        return candidate
+
+    reasons = _nvda_debit_spread_candidate_reasons(candidate, settings)
+    if reasons:
+        return None
+    return replace(
+        candidate,
+        reason_codes=(
+            *candidate.reason_codes,
+            "nvda_debit_spread_experimental_gate_passed",
+        ),
+    )
+
+
+def _nvda_debit_spread_candidate_reasons(
+    candidate: StrategyCandidate,
+    settings,
+) -> tuple[str, ...]:
+    reasons: list[str] = []
+    if (
+        candidate.max_profit is None
+        or candidate.max_loss is None
+        or candidate.max_loss <= 0
+        or candidate.max_profit / candidate.max_loss
+        < settings.strategy.nvda_debit_spread_min_reward_risk
+    ):
+        reasons.append("nvda_debit_spread_reward_risk_below_1_5")
+
+    width = _spread_width(candidate)
+    if width is None or width > settings.strategy.nvda_debit_spread_max_width:
+        reasons.append("nvda_debit_spread_width_too_wide")
+    return tuple(reasons)
+
+
+def _spread_width(candidate: StrategyCandidate) -> float | None:
+    strikes = [leg.contract.strike for leg in candidate.legs]
+    if len(strikes) < 2:
+        return None
+    return max(strikes) - min(strikes)

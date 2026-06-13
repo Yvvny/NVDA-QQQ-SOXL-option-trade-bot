@@ -10,9 +10,9 @@ from decimal import Decimal
 from pathlib import Path
 from typing import Any
 
-from trading_bot.core.time_utils import now_new_york
 from trading_bot.core.enums import OptionType
 from trading_bot.core.models import OptionContract, UnderlyingQuote
+from trading_bot.core.time_utils import now_new_york
 
 
 class TastytradeDataError(RuntimeError):
@@ -465,7 +465,10 @@ def _limit_contract_count(options: Sequence[Any], max_contracts: int) -> list[An
 def _chunk_symbols(symbols: Sequence[str], batch_size: int) -> list[tuple[str, ...]]:
     if batch_size <= 0:
         raise ValueError("batch_size must be positive")
-    return [tuple(symbols[index : index + batch_size]) for index in range(0, len(symbols), batch_size)]
+    return [
+        tuple(symbols[index : index + batch_size])
+        for index in range(0, len(symbols), batch_size)
+    ]
 
 
 def _as_events(events: Any) -> list[Any]:

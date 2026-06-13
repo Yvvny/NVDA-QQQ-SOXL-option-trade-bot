@@ -75,10 +75,15 @@ class DryRunBotRunner:
         regime_label = _regime_label_for_snapshot(snapshot)
         contracts = snapshot.option_contracts
         entry_timing = _entry_timing_context_for_snapshot(snapshot)
-        score_inputs = _score_inputs_for_snapshot(
-            regime_label,
-            contracts,
-            entry_timing=entry_timing,
+        score_inputs = (
+            _mock_score_inputs(regime_label)
+            if self.source == "mock"
+            else _score_inputs_for_snapshot(
+                regime_label,
+                contracts,
+                entry_timing=entry_timing,
+                settings=self.settings,
+            )
         )
         portfolio_state = PortfolioState(account_equity=self.settings.account.assumed_equity)
         candidates = self.selector.generate_candidates(
@@ -207,9 +212,11 @@ def _score_inputs_for_snapshot(
     contracts: tuple[OptionContract, ...],
     *,
     entry_timing: EntryTimingContext | None = None,
+    settings: BotSettings | None = None,
 ) -> tuple[StrategyScoreInput, ...]:
     bid_ask_pct = _median_bid_ask_pct_of_mid(contracts)
     volume, open_interest = _activity_from_contracts(contracts)
+    debit_price_action_config = _debit_price_action_config(settings)
     return (
         StrategyScoreInput(
             strategy_name="put_credit_spread",
@@ -222,6 +229,7 @@ def _score_inputs_for_snapshot(
             price_above_vwap=None,
             breakout_or_pullback_confirmed=False,
             entry_timing=entry_timing,
+            **debit_price_action_config,
         ),
         StrategyScoreInput(
             strategy_name="call_credit_spread",
@@ -234,6 +242,7 @@ def _score_inputs_for_snapshot(
             price_above_vwap=None,
             breakout_or_pullback_confirmed=False,
             entry_timing=entry_timing,
+            **debit_price_action_config,
         ),
         StrategyScoreInput(
             strategy_name="call_debit_spread",
@@ -246,6 +255,7 @@ def _score_inputs_for_snapshot(
             price_above_vwap=None,
             breakout_or_pullback_confirmed=False,
             entry_timing=entry_timing,
+            **debit_price_action_config,
         ),
         StrategyScoreInput(
             strategy_name="put_debit_spread",
@@ -258,6 +268,7 @@ def _score_inputs_for_snapshot(
             price_above_vwap=None,
             breakout_or_pullback_confirmed=False,
             entry_timing=entry_timing,
+            **debit_price_action_config,
         ),
     )
 
@@ -268,6 +279,22 @@ def _entry_timing_context_for_snapshot(snapshot: TastytradeMarketSnapshot) -> En
         timestamp=quote.timestamp if quote is not None else None,
         underlying_price=quote.last if quote is not None else None,
     )
+
+
+def _debit_price_action_config(settings: BotSettings | None) -> dict[str, float | int]:
+    if settings is None:
+        return {}
+    return {
+        "debit_spread_pa_lookback_candles": (
+            settings.strategy.debit_spread_pa_lookback_candles
+        ),
+        "debit_spread_pa_min_body_atr_multiple": (
+            settings.strategy.debit_spread_pa_min_body_atr_multiple
+        ),
+        "debit_spread_pa_vwap_reclaim_tolerance_atr_multiple": (
+            settings.strategy.debit_spread_pa_vwap_reclaim_tolerance_atr_multiple
+        ),
+    }
 
 
 def _mock_score_inputs(regime_label: RegimeLabel) -> tuple[StrategyScoreInput, ...]:

@@ -14,6 +14,9 @@ from trading_bot.regime.classifier import RegimeLabel
 from trading_bot.strategies.base import blocking_liquidity_warnings, contract_liquidity_warnings
 from trading_bot.strategies.scoring import StrategyScoreInput, score_strategy_setup
 from trading_bot.strategies.timing_filters import evaluate_entry_timing
+from trading_bot.strategies.trend_participation import (
+    nvda_debit_spread_pre_candidate_reasons,
+)
 
 
 def build_scan_diagnostics(
@@ -35,6 +38,7 @@ def build_scan_diagnostics(
     strategies = [
         _strategy_diagnostics(
             settings=settings,
+            symbol=symbol,
             strategy_name=score_input.strategy_name,
             contracts=contracts,
             eligible_contracts=eligible_contracts,
@@ -73,6 +77,7 @@ def build_scan_diagnostics(
 def _strategy_diagnostics(
     *,
     settings: BotSettings,
+    symbol: str,
     strategy_name: str,
     contracts: Sequence[OptionContract],
     eligible_contracts: Sequence[OptionContract],
@@ -83,6 +88,7 @@ def _strategy_diagnostics(
     score = score_strategy_setup(score_input)
     reason_codes = _candidate_block_reasons(
         settings=settings,
+        symbol=symbol,
         strategy_name=strategy_name,
         contracts=contracts,
         eligible_contracts=eligible_contracts,
@@ -113,6 +119,7 @@ def _strategy_diagnostics(
 def _candidate_block_reasons(
     *,
     settings: BotSettings,
+    symbol: str,
     strategy_name: str,
     contracts: Sequence[OptionContract],
     eligible_contracts: Sequence[OptionContract],
@@ -126,6 +133,15 @@ def _candidate_block_reasons(
         return ("candidate_generated",)
 
     reasons: list[str] = []
+    reasons.extend(
+        nvda_debit_spread_pre_candidate_reasons(
+            underlying=symbol,
+            strategy_name=strategy_name,
+            score=score_strategy_setup(score_input),
+            iv_rank=score_input.iv_rank,
+            settings=settings,
+        )
+    )
     if score_total < settings.strategy.min_entry_score:
         reasons.append("score_below_min_entry_score")
     if "short_premium_blocked_crash_risk_off" in score_reason_codes:

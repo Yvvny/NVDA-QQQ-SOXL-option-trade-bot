@@ -1,9 +1,10 @@
 import json
-from dataclasses import dataclass
+from dataclasses import dataclass, replace
 from datetime import UTC, date, datetime
 from pathlib import Path
 
 from trading_bot.cli import main
+from trading_bot.config.settings import load_settings
 from trading_bot.core.enums import OptionType
 from trading_bot.core.models import OptionContract, UnderlyingQuote
 from trading_bot.data.tastytrade_source import TastytradeMarketSnapshot
@@ -47,6 +48,7 @@ def test_cli_run_once_outputs_json_and_writes_audit_log(tmp_path, capsys):
 def test_runner_can_use_tastytrade_source_with_injected_snapshot(tmp_path):
     audit_log = tmp_path / "audit.jsonl"
     runner = DryRunBotRunner(
+        settings=_lenient_credit_test_settings(),
         source="tastytrade",
         tastytrade_data_source=_FakeTastytradeDataSource(),
         audit_log_path=audit_log,
@@ -128,6 +130,19 @@ def _contract(
         delta=delta,
         volume=100,
         open_interest=1000,
+    )
+
+
+def _lenient_credit_test_settings():
+    settings = load_settings(env={})
+    return replace(
+        settings,
+        strategy=replace(
+            settings.strategy,
+            min_entry_score=50,
+            credit_spread_min_planned_reward_risk=0.20,
+        ),
+        selection=replace(settings.selection, enabled=False),
     )
 
 
